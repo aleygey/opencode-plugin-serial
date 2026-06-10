@@ -14,19 +14,22 @@ HTTP/WebSocket server so nothing needs to mount routes in core.
 
 ## What it gives the agent
 
-11 `serial_*` tools, registered via the `tool` plugin hook:
+14 `serial_*` tools, registered via the `tool` plugin hook:
 
 | tool | purpose |
 | --- | --- |
-| `serial_list_ports` | enumerate physical devices on the host |
+| `serial_list_ports` | enumerate physical devices, annotated from the device map (name/model/baud/in-use) |
+| `serial_probe` | which ports have a LIVE machine, and what it looks like (banner/prompt classification) |
+| `serial_devices` | list / reload / scaffold the `devices.json` device map |
 | `serial_list` | list open sessions |
-| `serial_create` | open a session (returns a SerialID; reuses an existing session on the same path) |
-| `serial_write` | write bytes (escape decoding: `\r \n \t \xNN \u####`) |
-| `serial_collect` | atomic write → wait-for-prompt → return captured output |
-| `serial_read_recent` | read the ring buffer, incremental via `since_cursor` |
+| `serial_create` | open a session + acquire the device lease (refused if another agent drives it; `takeover` to seize) |
+| `serial_write` | write bytes (escape decoding: `\r \n \t \xNN \u####`; needs the lease) |
+| `serial_collect` | atomic write → wait-for-prompt → return captured output (auto de-noised) |
+| `serial_read_recent` | read the ring buffer, incremental via `since_cursor`, with de-noise flags |
+| `serial_digest` | structured "did anything break?" summary (counts + deduped error lines) |
 | `serial_grep` | regex-filter the ring buffer (token-cheap) |
 | `serial_wait` | block until a pattern appears (sub-ms, in the event loop) |
-| `serial_arm` / `serial_disarm` | server-side reactive triggers (e.g. spam `slp` to break u-boot) |
+| `serial_arm` / `serial_disarm` | server-side reactive triggers (e.g. spam `slp` to break u-boot; needs the lease) |
 | `serial_close` | close a session |
 
 ### Example: break into u-boot (reactive trigger)
@@ -51,17 +54,68 @@ tools and your monitor watch the *same* session.
 
 Once the plugin is loaded the TUI gets:
 
-- **Sidebar block** — active serial sessions + status dot (green = connected),
-  refreshed automatically.
-- **Full-screen monitor** — run the **`/serial`** command (or pick *Serial
-  Monitor* from the command palette) to open it. Keys: `[` / `]` switch session,
-  `esc` exits. It replays ring-buffer history from cursor 0, so you see
-  everything the agent did — including before you opened the monitor — then live
-  data.
+- **Bottom status bar** (`app_bottom`) — one compact live line per session
+  (status dot, path@baud, byte counter, last output line). Appears
+  automatically the moment the agent calls `serial_create`; no navigation.
+- **Sidebar block** — active serial sessions + status dot (needs the sidebar
+  visible: terminal wider than 120 cols or the sidebar toggle).
+- **Full-screen interactive monitor** — run **`/serial`** (or *Serial Monitor*
+  in the palette). Replays ring-buffer history from cursor 0, then live data,
+  rendered as ONE batched text block so a flooding device can't pin the TUI CPU.
 
-Under the hood the monitor reads `<worktree>/.opencode/serial/api.json` to find
-the plugin's server port and attaches to `/serial/:id/connect?cursor=N`. Any
-other client (a web view, `websocat`, …) can attach the same way.
+### Typing into the device (v0.3.0)
+
+The full-screen monitor has a dedicated input line — your command is composed
+*outside* the scrolling stream, so flooding output can never eat what you type.
+Enter sends it over the same WebSocket the monitor already holds (the server
+writes any text frame to the port verbatim).
+
+| key | action |
+| --- | --- |
+| `Enter` | send line + EOL (default `\r\n`, per-device via `devices.json` `eol`) |
+| `Tab` / `Shift+Tab` | complete the current token / cycle candidates |
+| `↑` / `↓` | history (per-device, persisted, **shared with the agent** — `↑` recalls commands the agent ran too) |
+| `Ctrl+R` | reverse-i-search through history (bash-style) |
+| `Ctrl+C` / `Ctrl+G` | send `0x03` — interrupt the program on the DEVICE |
+| `Esc` | cancel completion/search → clear input → exit the view |
+| `[` `]` (input empty) / `F3` `F4` | switch session |
+| `Ctrl+U/K/W/A/E`, `Home/End`, arrows | line editing |
+
+**Completion never queries the device.** The serial line is a single shared
+channel that the agent pattern-matches (`serial_collect` / `serial_wait`) — a
+hidden `ls` round-trip would pollute the stream it parses. Candidates come from
+three local sources instead: command history, tokens already seen in the output
+(so `ls` a directory once and its entries become completable), and a static
+busybox/u-boot dict plus per-device `commands` from `devices.json`.
+
+While the monitor is open the plugin pushes a dedicated keymap mode (the same
+mechanism opencode dialogs use), so host keys like `Tab` (agent cycle) and
+`Ctrl+C` (app exit) are released to the monitor; `Ctrl+X` leader chords still
+reach the host (`ctrl+x q` quits opencode). On older opencode builds without
+`api.mode` the hint line warns and `Ctrl+G` doubles as the interrupt key.
+
+The header shows **`driver: agent <session>`** when an agent holds the device
+lease. Human input intentionally bypasses the lease — you outrank the agent —
+the badge just keeps the two-writers situation visible.
+
+Per-device input options in `devices.json` (matched by `match.path` in the TUI):
+
+```jsonc
+{ "devices": [{
+    "name": "proto-A", "match": { "path": "COM3", "serialNumber": "0001" },
+    "baudRate": 1500000,
+    "eol": "lf",                      // "cr" | "lf" | "crlf" | raw string
+    "commands": ["rkdeveloptool"],    // extra Tab-completion entries
+    "localEcho": false                 // true for consoles with echo off
+}]}
+```
+
+Under the hood the monitor reads `.opencode/serial/api.json` (cwd, then home —
+the server writes both) to find the server port and attaches to
+`/serial/:id/connect?cursor=N`. Any other client (a web view, `websocat`, …)
+can attach the same way. Command history lives in
+`~/.opencode/serial/history/<port>.json`; the server appends the agent's
+newline-terminated writes to the same file.
 
 ---
 

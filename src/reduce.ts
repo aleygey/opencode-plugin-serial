@@ -202,7 +202,8 @@ function collapse(
       }
     }
     if (bestP === 0) {
-      out.push({ kind: "line", text: rawLines[i] })
+      // parallel arrays (rawLines/keys/norms share length); i < n is loop-guarded
+      out.push({ kind: "line", text: rawLines[i]! })
       i++
       continue
     }
@@ -214,10 +215,15 @@ function collapse(
       partial++
     }
     if (bestP === 1) {
-      const norm = norms[i]
-      const seg: Segment = { kind: "fold", sample: rawLines[i], count: bestReps, volatile: norm.volatile }
+      const norm = norms[i]!
+      const seg: Extract<Segment, { kind: "fold" }> = {
+        kind: "fold",
+        sample: rawLines[i]!,
+        count: bestReps,
+        volatile: norm.volatile,
+      }
       if (opts.showRange && norm.volatile) {
-        seg.range = [rawLines[i], rawLines[i + consumed - 1]]
+        seg.range = [rawLines[i]!, rawLines[i + consumed - 1]!]
       }
       out.push(seg)
     } else {

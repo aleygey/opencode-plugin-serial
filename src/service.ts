@@ -23,6 +23,9 @@
 
 import { EventEmitter } from "node:events"
 import { randomBytes } from "node:crypto"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import os from "node:os"
+import nodePath from "node:path"
 import { z } from "zod"
 import * as driver from "#serial-driver"
 import { SerialID } from "./schema"
@@ -158,6 +161,9 @@ export namespace Serial {
       stopBits: z.number().optional(),
       parity: z.enum(["none", "even", "odd", "mark", "space"]).optional(),
       status: z.enum(["connected", "disconnected", "error"]),
+      // Device-lease holder (opencode sessionID). Exposed so monitors can show
+      // a "driver: agent …" badge — human input bypasses the lease by design.
+      owner: z.string().optional(),
     })
     .meta({ ref: "Serial" })
 
@@ -417,8 +423,13 @@ export namespace Serial {
         (input.parity === undefined || e.parity === input.parity)
       ) {
         log.info("Serial.create reusing existing session for same path/params", { id: e.id, path: e.path })
-        // We now hold the lease (acquire above didn't throw) — bind it.
-        if (owner) existing.owner = owner
+        // We now hold the lease (acquire above didn't throw) — bind it and
+        // surface the new driver to monitors.
+        if (owner) {
+          existing.owner = owner
+          existing.info.owner = owner
+          emit("serial.updated", { info: existing.info })
+        }
         existing.deviceKey = deviceKey
         return e
       }
@@ -446,6 +457,7 @@ export namespace Serial {
       stopBits: input.stopBits,
       parity: input.parity,
       status: "connected",
+      owner,
     }
     const session: Active = {
       info,
@@ -745,6 +757,42 @@ export namespace Serial {
         if (!c.ok) throw new SerialLockError(c.holder!)
       }
       session.port.write(data)
+      // Mirror newline-terminated agent commands into the shared per-device
+      // history file so the human monitor can ↑-recall what the agent ran.
+      if (owner && /[\r\n]$/.test(data)) appendSharedHistory(session.info.path, data)
+    }
+  }
+
+  // ── Shared command history ──────────────────────────────────────────────────
+  // One JSON per device path — the SAME file/format the TUI monitor's
+  // HistoryStore reads and writes (<home>/.opencode/serial/history/<path>.json,
+  // { version: 1, entries: [{ cmd, source, at }] }, cap 500, consecutive
+  // dedup). Keep the sanitize rule in sync with monitor.tsx or the keys split.
+  // Best-effort: failures never affect the write path. Concurrent TUI/server
+  // writers are last-writer-wins.
+  const HISTORY_CAP = 500
+  function appendSharedHistory(portPath: string, data: string) {
+    try {
+      const cmd = data.replace(/[\r\n]+$/, "")
+      if (!cmd.trim()) return
+      const dir = nodePath.join(os.homedir(), ".opencode", "serial", "history")
+      const file = nodePath.join(dir, (portPath.replace(/[^A-Za-z0-9._-]+/g, "_") || "default") + ".json")
+      let entries: Array<{ cmd: string; source: string; at: number }> = []
+      try {
+        const raw = JSON.parse(readFileSync(file, "utf8")) as { entries?: typeof entries }
+        if (Array.isArray(raw.entries)) entries = raw.entries
+      } catch {}
+      const last = entries[entries.length - 1]
+      if (last && last.cmd === cmd) {
+        last.at = Date.now()
+      } else {
+        entries.push({ cmd, source: "agent", at: Date.now() })
+        if (entries.length > HISTORY_CAP) entries = entries.slice(-HISTORY_CAP)
+      }
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(file, JSON.stringify({ version: 1, entries }))
+    } catch {
+      // best-effort
     }
   }
 

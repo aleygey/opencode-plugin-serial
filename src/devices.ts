@@ -44,6 +44,13 @@ export type Device = {
   match: DeviceMatch
   baudRate?: number
   prompt?: { breakSeq?: string; readyRe?: string }
+  /** Line terminator the monitor's input line appends: "cr" | "lf" | "crlf" |
+   *  raw string. Default "\r\n". (Read client-side by the TUI via match.path.) */
+  eol?: string
+  /** Extra Tab-completion dictionary entries shown in the monitor (vendor CLI verbs etc). */
+  commands?: string[]
+  /** Monitor locally echoes sent commands — for consoles with echo off. Default false. */
+  localEcho?: boolean
   notes?: string
 }
 
