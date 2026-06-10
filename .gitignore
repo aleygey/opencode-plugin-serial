@@ -5,3 +5,5 @@ dist/
 *.tgz
 tsconfig.check.json
 tsconfig.tsxcheck.json
+adaptation-kit/
+*-adaptation-kit.zip
