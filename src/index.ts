@@ -23,11 +23,18 @@ import { serialTools } from "./tools"
 import { Serial } from "./service"
 import { baseDir } from "./paths"
 import { startSerialServer } from "./server"
+import { registerToWinConsole, type WinConsoleClient } from "./winhost"
 
 // Tear down all sessions (close ports, clear timers, drop subscribers) when the
 // host process exits. Registered once at module scope.
+let winClient: WinConsoleClient | undefined
 for (const signal of ["exit", "SIGINT", "SIGTERM"] as const) {
-  process.once(signal, () => Serial.disposeAll())
+  process.once(signal, () => {
+    try {
+      winClient?.stop()
+    } catch {}
+    Serial.disposeAll()
+  })
 }
 
 export const SerialPlugin: Plugin = async (input, options) => {
@@ -51,11 +58,35 @@ export const SerialPlugin: Plugin = async (input, options) => {
   // tools — fall back to headless (tools still work, just no live monitor).
   if (opts["server"] !== false) {
     try {
-      startSerialServer({ base, port: typeof opts["port"] === "number" ? (opts["port"] as number) : undefined })
+      const server = startSerialServer({
+        base,
+        port: typeof opts["port"] === "number" ? (opts["port"] as number) : undefined,
+      })
+
+      // Optional: register with win-console (super-work-host) so its panel
+      // (ports / sessions / leases / device map) shows up there. Opt-in via the
+      // `winConsole` URL option; loopback-only per the daemon's SSRF guard.
+      const winUrl = typeof opts["winConsole"] === "string" ? (opts["winConsole"] as string) : undefined
+      if (winUrl && server.port) {
+        try {
+          winClient = registerToWinConsole({
+            url: winUrl,
+            token: typeof opts["winConsoleToken"] === "string" ? (opts["winConsoleToken"] as string) : undefined,
+            apiBaseUrl: `http://127.0.0.1:${server.port}`,
+            panelUrl: `http://127.0.0.1:${server.port}/serial/panel`,
+          })
+        } catch {
+          // win-console not running / unreachable — panel just won't appear
+        }
+      }
     } catch {
       // headless fallback
     }
   }
+
+  // Auto-open devices flagged `autoOpen` in devices.json (fire-and-forget) so
+  // /serial shows them without waiting for the agent to serial_create.
+  void Serial.autoOpenConfigured()
 
   return { tool: serialTools }
 }

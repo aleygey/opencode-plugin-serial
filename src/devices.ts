@@ -27,7 +27,7 @@
  * }
  */
 
-import { readFileSync } from "node:fs"
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
 
 export type DeviceMatch = {
@@ -51,6 +51,10 @@ export type Device = {
   commands?: string[]
   /** Monitor locally echoes sent commands — for consoles with echo off. Default false. */
   localEcho?: boolean
+  /** Open this device automatically when the plugin starts (needs a concrete
+   *  match.path, e.g. "COM3" or "telnet://host:port"). Lets /serial show the
+   *  session without waiting for the agent to serial_create. Default false. */
+  autoOpen?: boolean
   notes?: string
 }
 
@@ -90,6 +94,20 @@ export function reload(): { count: number; from?: string } {
 
 export function all(): Device[] {
   return devices
+}
+
+/** Overwrite devices.json (used by the win-console panel's PUT /serial/devices).
+ *  Updates the in-memory list on success. Best-effort; returns the target path. */
+export function save(list: Device[]): { ok: boolean; from?: string; reason?: string } {
+  if (!loadedFrom) return { ok: false, reason: "service not configured (base dir unset)" }
+  try {
+    mkdirSync(path.dirname(loadedFrom), { recursive: true })
+    writeFileSync(loadedFrom, JSON.stringify({ devices: list }, null, 2))
+    devices = list
+    return { ok: true, from: loadedFrom }
+  } catch {
+    return { ok: false, from: loadedFrom }
+  }
 }
 
 const eqi = (a?: string, b?: string) => !!a && !!b && a.toLowerCase() === b.toLowerCase()

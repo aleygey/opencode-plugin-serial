@@ -19,7 +19,7 @@
  * readable ownership + crash recovery.
  */
 
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, readdirSync, existsSync } from "node:fs"
 import path from "node:path"
 
 export type Lease = {
@@ -114,5 +114,50 @@ export class LockManager {
         // already gone
       }
     }
+  }
+
+  /** All current leases (this process's in-memory map + on-disk locks from
+   *  other processes), each tagged with whether it has gone stale (heartbeat
+   *  older than its TTL). For the win-console panel / GET /serial/leases. */
+  list(): Array<Lease & { stale: boolean }> {
+    const now = Date.now()
+    const seen = new Set<string>()
+    const out: Array<Lease & { stale: boolean }> = []
+    for (const l of this.mem.values()) {
+      seen.add(l.deviceKey)
+      out.push({ ...l, stale: !this.fresh(l, now) })
+    }
+    try {
+      for (const f of readdirSync(this.dir)) {
+        if (!f.endsWith(".lock")) continue
+        try {
+          const l = JSON.parse(readFileSync(path.join(this.dir, f), "utf8")) as Lease
+          if (l && l.deviceKey && !seen.has(l.deviceKey)) {
+            seen.add(l.deviceKey)
+            out.push({ ...l, stale: !this.fresh(l, now) })
+          }
+        } catch {
+          // skip unreadable/partial lock file
+        }
+      }
+    } catch {
+      // locks dir missing — only in-memory leases
+    }
+    return out
+  }
+
+  /** Force-release a lease regardless of owner (panel "kick" for a stale or
+   *  abandoned hold). Returns true if a lease existed. */
+  forceRelease(key: string): boolean {
+    // Count a purely on-disk (other-process / crashed) lease too, so a
+    // cross-process kick correctly reports it existed.
+    const had = this.mem.has(key) || existsSync(this.file(key))
+    this.mem.delete(key)
+    try {
+      unlinkSync(this.file(key))
+    } catch {
+      // already gone
+    }
+    return had
   }
 }

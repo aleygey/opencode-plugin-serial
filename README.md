@@ -174,7 +174,51 @@ Pass options as the second element of the plugin spec:
 | `enabled` | boolean | `true` | set `false` to disable the whole plugin |
 | `server` | boolean | `true` | set `false` to skip the `/serial` HTTP/WS server (tools still work; no live monitor) |
 | `port` | number | random free port | fix the `/serial` server port (useful if the monitor's cwd-based discovery doesn't fit your setup) |
-| `directory` | string | `<worktree>/.opencode/serial` | base dir for `api.json` |
+| `directory` | string | `<worktree>/.opencode/serial` | base dir for `api.json`, `devices.json`, `locks/`, history |
+| `winConsole` | string | — | win-console (super-work-host) daemon URL, e.g. `http://127.0.0.1:8799`. When set, the plugin registers a panel there (ports / sessions / leases / editable device map) and heartbeats it. Loopback only. |
+| `winConsoleToken` | string | — | `x-winhost-token` if the daemon sets `WIN_HOST_PLUGIN_TOKEN`. |
+
+### Auto-open ports on startup (v0.4.0)
+
+Add `"autoOpen": true` (plus a concrete `match.path`) to a `devices.json` entry
+and the plugin opens it the moment it loads — so `/serial` and the bottom bar
+show the session without waiting for the agent to `serial_create`. Auto-opened
+sessions have no lease owner, so an agent can still lease them later.
+
+```jsonc
+{ "devices": [
+  { "name": "proto-A", "model": "RK3568", "match": { "path": "COM3", "serialNumber": "0001" },
+    "baudRate": 1500000, "eol": "cr", "autoOpen": true }
+]}
+```
+
+### Line endings (v0.4.0)
+
+`eol` (`"cr"` | `"lf"` | `"crlf"` | raw) now applies to **both** the human input
+line **and the agent's** writes: the service normalizes whatever trailing
+terminator was sent to the device's `eol` (so the agent can keep emitting `\r\n`
+and a `\r`-only board still gets a bare `\r`; no double terminator; pure
+passthrough when no `eol` is set). Incoming `\r`-only output is also split into
+lines for display/grep/digest. Resolve it via the device map (or a per-call
+`eol` on `serial_create`).
+
+### Tab to open the monitor (v0.4.0)
+
+The Serial Monitor command registers `Tab` (repurposing the low-value host
+`agent.cycle`) to open `/serial`. Inside the monitor, `Tab` stays completion
+(the route pushes its own keymap mode). If your opencode build doesn't let a
+plugin command's keybind win over the built-in `agent.cycle`, rebind it in your
+opencode keybinds config, or just use `/serial`.
+
+### win-console panel (v0.4.0)
+
+With `winConsole` set, the plugin appears in win-console as a panel showing
+ports (name/model/in-use), open sessions, device leases (who's driving, with a
+force-release button for stale holds), and an editable `devices.json`. The panel
+is served by this plugin at `GET /serial/panel` and talks to its own `/serial`
+REST — win-console only embeds the iframe + heartbeats it. Topology: run this
+plugin as a **Windows** process (so it can open COMx) reachable on loopback; the
+agent in WSL reaches the tools as usual.
 
 ---
 

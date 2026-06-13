@@ -16,6 +16,7 @@ import path from "node:path"
 import { Serial } from "./service"
 import { SerialID } from "./schema"
 import { apiInfoFile } from "./paths"
+import { panelHtml } from "./panel"
 
 export type SerialServer = { port: number; stop(): void }
 
@@ -29,7 +30,23 @@ export function startSerialServer(opts: { base: string; port?: number }): Serial
   const app = new Hono()
 
   app.get("/serial", async (c) => c.json(await Serial.list()))
-  app.get("/serial/ports", async (c) => c.json(await Serial.listPorts()))
+  // Annotated ports (device name / model / suggested baud / in-use) for the panel.
+  app.get("/serial/ports", async (c) => c.json(await Serial.listPortsAnnotated()))
+  // win-console panel data + the iframe page itself. These MUST be registered
+  // before "/serial/:id" or Hono would match "leases"/"devices"/"panel" as :id.
+  app.get("/serial/leases", (c) => c.json(Serial.leaseList()))
+  // c.req.param() is already URL-decoded by Hono — do NOT decode again (would
+  // corrupt keys containing %, e.g. path-based deviceKeys). Matches the panel's
+  // single encodeURIComponent.
+  app.delete("/serial/leases/:key", (c) => c.json(Serial.forceReleaseLease(c.req.param("key"))))
+  app.get("/serial/devices", (c) => c.json(Serial.listDevices()))
+  app.put("/serial/devices", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { devices?: unknown }
+    const list = Array.isArray(body.devices) ? (body.devices as Parameters<typeof Serial.writeDevices>[0]) : []
+    const r = Serial.writeDevices(list)
+    return c.json(r, r.ok ? 200 : 500)
+  })
+  app.get("/serial/panel", (c) => c.html(panelHtml()))
   app.post("/serial", async (c) => {
     const body = await c.req.json().catch(() => ({}))
     return c.json(await Serial.create(Serial.CreateInput.parse(body)))

@@ -1035,10 +1035,14 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       return
     }
 
-    // 5. tab / shift+tab — completion cycling
-    if (k.name === "tab") {
+    // 5. tab / shift+tab — completion cycling. Ctrl+N is a shadow-proof backup:
+    //    the /serial command registers keybind:"tab" to OPEN the monitor, and if
+    //    a given opencode build doesn't suppress that command binding inside the
+    //    route (keymap-mode dependent, unverified), Tab here could be eaten by
+    //    the host before this handler runs — Ctrl+N always reaches us.
+    if (k.name === "tab" || (k.ctrl && k.name === "n")) {
       consume()
-      onTab(k.shift)
+      onTab(k.shift) // shift+tab cycles back; ctrl+n forward-only
       return
     }
     // Any other key COMMITS the currently selected candidate (its text is
@@ -1118,7 +1122,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
             </span>
           </Show>
         </text>
-        <text fg={theme().textMuted}>tab complete · ↑↓ history · ^R search · ^C intr · [ ]/F3 F4 switch · esc exit</text>
+        <text fg={theme().textMuted}>tab/^N complete · ↑↓ history · ^R search · ^C intr · [ ]/F3 F4 switch · esc exit</text>
       </box>
       <Show
         when={sessions().length > 0}
@@ -1195,6 +1199,12 @@ const tui: TuiPlugin = async (api) => {
       value: "serial.monitor.open",
       category: "Serial",
       slash: { name: "serial" },
+      // Repurpose Tab (host default = agent.cycle, low-value here) to open the
+      // serial monitor. Inside the monitor route this binding is suppressed by
+      // the keymap mode the route pushes, so Tab there stays completion. If a
+      // given opencode build doesn't honor a plugin command keybind over the
+      // built-in agent.cycle, rebind in opencode keybinds config (or use /serial).
+      keybind: "tab",
       onSelect: () => api.route.navigate(ROUTE, {}),
     },
   ])

@@ -425,6 +425,17 @@ export namespace Serial {
     }
   }
 
+  // Renew the device lease every 20s while a session is open so a live owner
+  // keeps it (a crashed owner's lease expires at its TTL). Reads session.owner
+  // at fire time, so a takeover/rebind that swaps the owner keeps renewing.
+  // Idempotent — safe to call from the fresh-open, reuse, and write paths.
+  function startLeaseTimer(session: Active) {
+    if (session.leaseTimer) return
+    session.leaseTimer = setInterval(() => {
+      if (locks && session.deviceKey && session.owner) locks.renew(session.deviceKey, session.owner)
+    }, 20_000)
+  }
+
   export async function create(
     input: CreateInput,
     ctx?: { owner?: string; takeover?: boolean },
@@ -455,14 +466,16 @@ export namespace Serial {
         (input.parity === undefined || e.parity === input.parity)
       ) {
         log.info("Serial.create reusing existing session for same path/params", { id: e.id, path: e.path })
-        // We now hold the lease (acquire above didn't throw) — bind it and
-        // surface the new driver to monitors.
+        // We now hold the lease (acquire above didn't throw) — bind it, start
+        // the heartbeat (an autoOpen'd / owner-less session had none), and
+        // surface the new driver to monitors. deviceKey first so renew has it.
+        existing.deviceKey = deviceKey
         if (owner) {
           existing.owner = owner
           existing.info.owner = owner
+          startLeaseTimer(existing)
           emit("serial.updated", { info: existing.info })
         }
-        existing.deviceKey = deviceKey
         return e
       }
     }
@@ -513,14 +526,7 @@ export namespace Serial {
     }
     sessions.set(id, session)
 
-    // Heartbeat the lease while the session is open so a live owner keeps it,
-    // but a crashed owner's lease expires (TTL). Renews for session.owner read
-    // at fire time, so a takeover that swaps owner keeps renewing correctly.
-    if (locks && owner) {
-      session.leaseTimer = setInterval(() => {
-        if (locks && session.deviceKey && session.owner) locks.renew(session.deviceKey, session.owner)
-      }, 20_000)
-    }
+    if (locks && owner) startLeaseTimer(session)
 
     port.onData((chunk) => {
       session.cursor += chunk.length
@@ -703,6 +709,61 @@ export namespace Serial {
     return Devices.scaffold(await driver.listPorts())
   }
 
+  export function writeDevices(list: Devices.Device[]): { ok: boolean; from?: string } {
+    return Devices.save(list)
+  }
+
+  // Lease enumeration / force-release for the win-console panel.
+  export function leaseList() {
+    return locks?.list() ?? []
+  }
+  export function forceReleaseLease(deviceKey: string): boolean {
+    const released = locks?.forceRelease(deviceKey) ?? false
+    // Also clear the in-process session that believes it holds this device, so
+    // the monitor badge clears and the kicked owner must re-acquire on its next
+    // write. ADVISORY: this does not interrupt an in-flight write, and the
+    // kicked agent will silently re-acquire on its next write() (re-acquire
+    // semantics) unless another agent grabs the device first.
+    for (const s of sessions.values()) {
+      if (s.deviceKey === deviceKey && s.owner) {
+        if (s.leaseTimer) {
+          clearInterval(s.leaseTimer)
+          s.leaseTimer = undefined
+        }
+        s.owner = undefined
+        s.info.owner = undefined
+        emit("serial.updated", { info: s.info })
+      }
+    }
+    return released
+  }
+
+  // ── Auto-open (startup) ─────────────────────────────────────────────────────
+  // Open every devices.json entry flagged autoOpen with a concrete match.path,
+  // so /serial shows the session without waiting for the agent to serial_create.
+  // Sessions open with NO owner (lease stays free) — an agent can lease them
+  // later via create()'s reuse path. Per-device failures (unplugged / EBUSY) are
+  // swallowed so one bad port doesn't block the rest.
+  export async function autoOpenConfigured(): Promise<{ opened: string[]; failed: string[] }> {
+    const targets = Devices.all().filter((d) => d.autoOpen && d.match?.path)
+    const opened: string[] = []
+    const failed: string[] = []
+    // Open in parallel so one slow/unplugged port (esp. telnet://) can't
+    // serialize the rest. Each open is independently try/caught.
+    await Promise.allSettled(
+      targets.map(async (d) => {
+        const p = d.match!.path!
+        try {
+          await create({ path: p, baudRate: d.baudRate ?? 115200, title: d.name })
+          opened.push(p)
+        } catch {
+          failed.push(p)
+        }
+      }),
+    )
+    return { opened, failed }
+  }
+
   // ── Probe (Q2): is a live machine on this port, and what is it? ────────────
   // Transiently opens each candidate, listens (and optionally nudges with
   // \r\n), classifies the banner against the device map's readyRe (or generic
@@ -792,8 +853,18 @@ export namespace Serial {
     const session = sessions.get(id)
     if (session && session.info.status === "connected") {
       if (locks && session.deviceKey && owner) {
-        const c = locks.check(session.deviceKey, owner)
-        if (!c.ok) throw new SerialLockError(c.holder!)
+        // Re-acquire (not just check): refreshes our hold, blocks only a
+        // DIFFERENT live owner, and re-grabs a lease that was force-released or
+        // expired — restoring a single writer after an advisory kick. Re-bind
+        // the badge/heartbeat if ownership changed.
+        const denied = locks.acquire(session.deviceKey, owner)
+        if (denied) throw new SerialLockError(denied)
+        if (session.owner !== owner) {
+          session.owner = owner
+          session.info.owner = owner
+          startLeaseTimer(session)
+          emit("serial.updated", { info: session.info })
+        }
       }
       // Normalize the trailing terminator to the device's eol so the agent can
       // keep emitting \r\n (its documented habit) and a \r-only device still
@@ -916,7 +987,12 @@ export namespace Serial {
     const session = sessions.get(id)
     if (!session) return undefined
 
-    const re = new RegExp(options.pattern)
+    let re: RegExp
+    try {
+      re = new RegExp(options.pattern)
+    } catch (e) {
+      throw new Error(`invalid grep pattern /${options.pattern}/: ${(e as Error).message}`)
+    }
     const totalEnd = session.cursor
     const totalStart = session.bufferCursor
     const buffer = session.buffer
@@ -969,7 +1045,9 @@ export namespace Serial {
       matches,
       scannedFrom: fromCursor,
       scannedTo: totalEnd,
-      truncated: matches.length >= maxMatches,
+      // Only truncated if the scan actually hit the cap with more to find — not
+      // when the buffer happened to contain exactly maxMatches and ran to end.
+      truncated: stop,
     }
   }
 
@@ -980,7 +1058,12 @@ export namespace Serial {
     const session = sessions.get(id)
     if (!session) return undefined
 
-    const re = new RegExp(options.pattern, "m")
+    let re: RegExp
+    try {
+      re = new RegExp(options.pattern, "m")
+    } catch (e) {
+      throw new Error(`invalid wait pattern /${options.pattern}/: ${(e as Error).message}`)
+    }
     const contextLines = options.contextLines ?? 3
 
     // Fast path: pattern is already in the buffer.
@@ -1024,10 +1107,27 @@ export namespace Serial {
     const session = sessions.get(id)
     if (!session) return undefined
 
-    // A trigger writes to the port, so it needs the lease just like write().
+    // A trigger writes to the port, so it needs the lease just like write() —
+    // re-acquire so an armed agent (re)takes the lease and a different live
+    // owner is blocked.
     if (locks && session.deviceKey && owner) {
-      const c = locks.check(session.deviceKey, owner)
-      if (!c.ok) throw new SerialLockError(c.holder!)
+      const denied = locks.acquire(session.deviceKey, owner)
+      if (denied) throw new SerialLockError(denied)
+      if (session.owner !== owner) {
+        session.owner = owner
+        session.info.owner = owner
+        startLeaseTimer(session)
+        emit("serial.updated", { info: session.info })
+      }
+    }
+
+    let onPattern: RegExp | undefined
+    let untilPattern: RegExp | undefined
+    try {
+      onPattern = input.onPattern ? new RegExp(input.onPattern) : undefined
+      untilPattern = input.untilPattern ? new RegExp(input.untilPattern) : undefined
+    } catch (e) {
+      throw new Error(`invalid arm pattern: ${(e as Error).message}`)
     }
 
     const triggerId = "trg_" + randomBytes(6).toString("hex")
@@ -1036,8 +1136,8 @@ export namespace Serial {
       // Same eol normalization as write() — a u-boot break spam armed as
       // "slp\r\n" reaches a \r-only board as "slp\r".
       response: applyEol(input.response, session.eol),
-      onPattern: input.onPattern ? new RegExp(input.onPattern) : undefined,
-      untilPattern: input.untilPattern ? new RegExp(input.untilPattern) : undefined,
+      onPattern,
+      untilPattern,
       maxFires: input.maxFires,
       fires: 0,
       armedAt: Date.now(),
