@@ -117,6 +117,30 @@ export namespace Serial {
   export type ReduceOptions = ReduceOptionsImpl
   export const reduceLines = reduceLinesImpl
 
+  // ── EOL handling (Q: \r vs \r\n adaptation) ───────────────────────────────
+  // resolveEol maps a devices.json `eol` ("cr"|"lf"|"crlf"|raw) to the actual
+  // terminator string. applyEol rewrites ONLY a trailing terminator the caller
+  // already sent — so a bare payload (e.g. \x03 ctrl-C, or an unterminated
+  // fragment) is left untouched and there's never a double terminator. When the
+  // device map specifies no eol, Active.eol is undefined → byte-identical
+  // passthrough (pre-0.4 behavior preserved; opt-in per device).
+  function resolveEol(raw?: string): string | undefined {
+    if (!raw) return undefined
+    if (raw === "cr") return "\r"
+    if (raw === "lf") return "\n"
+    if (raw === "crlf") return "\r\n"
+    return raw
+  }
+  function applyEol(data: string, eol?: string): string {
+    return eol ? data.replace(/(?:\r\n|\r|\n)$/, eol) : data
+  }
+  // Split on \r\n, lone \r, OR \n — for DISPLAY/SPLIT on snapshot COPIES only;
+  // never mutates the ring buffer or cursor accounting. Lets a \r-only device's
+  // output break into lines for digest / wait-context.
+  function splitLines(s: string): string[] {
+    return s.split(/\r\n|\r|\n/)
+  }
+
   export type Socket = {
     readyState: number
     data?: unknown
@@ -137,6 +161,7 @@ export namespace Serial {
     waiters: Set<Waiter>
     scanCursor: number
     deviceKey?: string
+    eol?: string
     owner?: string
     leaseTimer?: ReturnType<typeof setInterval>
   }
@@ -164,6 +189,10 @@ export namespace Serial {
       // Device-lease holder (opencode sessionID). Exposed so monitors can show
       // a "driver: agent …" badge — human input bypasses the lease by design.
       owner: z.string().optional(),
+      // Resolved per-device line terminator (\r / \n / \r\n / raw). Surfaced so
+      // the monitor uses the SAME eol for human input as the write path uses for
+      // the agent, instead of re-matching devices.json by path.
+      eol: z.string().optional(),
     })
     .meta({ ref: "Serial" })
 
@@ -177,6 +206,9 @@ export namespace Serial {
     stopBits: z.number().optional(),
     parity: z.enum(["none", "even", "odd", "mark", "space"]).optional(),
     flowControl: z.boolean().optional(),
+    // Override the line terminator for this session ("cr"|"lf"|"crlf"|raw).
+    // Defaults to the matched device's devices.json `eol`, else passthrough.
+    eol: z.string().optional(),
   })
 
   export type CreateInput = z.infer<typeof CreateInput>
@@ -357,8 +389,8 @@ export namespace Serial {
         const matchEnd = matchStart + match[0].length
         const beforeText = window.slice(0, matchStart)
         const afterText = window.slice(matchEnd)
-        const beforeLines = beforeText.split(/\r?\n/)
-        const afterLines = afterText.split(/\r?\n/)
+        const beforeLines = splitLines(beforeText)
+        const afterLines = splitLines(afterText)
         try {
           w.resolve({
             matched: true,
@@ -448,6 +480,11 @@ export namespace Serial {
       ? `${matchedDev.name}${matchedDev.model ? ` (${matchedDev.model})` : ""}`
       : `Serial ${id.slice(-4)}`
 
+    // Per-device line terminator: explicit create override wins, else the
+    // device map's eol, else undefined (passthrough). Applies to BOTH agent
+    // writes (Serial.write) and the monitor's human input (reads it off Info).
+    const eol = resolveEol(input.eol ?? matchedDev?.eol)
+
     const info: Info = {
       id,
       title: input.title || defaultTitle,
@@ -458,6 +495,7 @@ export namespace Serial {
       parity: input.parity,
       status: "connected",
       owner,
+      eol,
     }
     const session: Active = {
       info,
@@ -470,6 +508,7 @@ export namespace Serial {
       waiters: new Set(),
       scanCursor: 0,
       deviceKey,
+      eol,
       owner,
     }
     sessions.set(id, session)
@@ -756,7 +795,10 @@ export namespace Serial {
         const c = locks.check(session.deviceKey, owner)
         if (!c.ok) throw new SerialLockError(c.holder!)
       }
-      session.port.write(data)
+      // Normalize the trailing terminator to the device's eol so the agent can
+      // keep emitting \r\n (its documented habit) and a \r-only device still
+      // gets a bare \r. No-op when no device eol is configured.
+      session.port.write(applyEol(data, session.eol))
       // Mirror newline-terminated agent commands into the shared per-device
       // history file so the human monitor can ↑-recall what the agent ran.
       if (owner && /[\r\n]$/.test(data)) appendSharedHistory(session.info.path, data)
@@ -843,7 +885,7 @@ export namespace Serial {
       tailBytes: options?.sinceCursor === undefined ? (options?.tailBytes ?? 65536) : undefined,
     })
     if (!snap) return undefined
-    const lines = snap.data.split("\n")
+    const lines = splitLines(snap.data)
     const errRe = /err|fail|panic|warn|fatal|exception|traceback|segfault|oops|assert/i
     const errorLines: string[] = []
     const seen = new Set<string>()
@@ -899,16 +941,28 @@ export namespace Serial {
 
     const slice = sliceOffset >= 0 && sliceOffset < buffer.length ? buffer.slice(sliceOffset) : ""
     const matches: Array<{ line: string; cursor: number }> = []
-    let cursorAt = fromCursor
-    const lines = slice.split("\n")
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i] ?? ""
+    // Walk lines with EXACT byte offsets, honoring \r\n / lone \r / \n
+    // terminators, so each match's cursor stays accurate regardless of the
+    // device's line ending (the old `+1` math assumed single-char \n).
+    const sep = /\r\n|\r|\n/g
+    let lineStart = 0
+    let sm: RegExpExecArray | null
+    let stop = false
+    const scanLine = (line: string, startOff: number): boolean => {
       re.lastIndex = 0
       if (re.test(line)) {
-        matches.push({ line, cursor: cursorAt })
-        if (matches.length >= maxMatches) break
+        matches.push({ line, cursor: fromCursor + startOff })
+        if (matches.length >= maxMatches) return true
       }
-      cursorAt += line.length + (i < lines.length - 1 ? 1 : 0)
+      return false
+    }
+    while (!stop && (sm = sep.exec(slice)) !== null) {
+      stop = scanLine(slice.slice(lineStart, sm.index), lineStart)
+      lineStart = sm.index + sm[0].length
+    }
+    if (!stop) {
+      const tail = slice.slice(lineStart)
+      if (tail.length) scanLine(tail, lineStart)
     }
 
     return {
@@ -941,8 +995,8 @@ export namespace Serial {
         matched: true,
         cursor: session.cursor,
         match: existingMatch[0],
-        before: beforeText.split(/\r?\n/).slice(-(contextLines + 1)).join("\n"),
-        after: afterText.split(/\r?\n/).slice(0, contextLines + 1).join("\n"),
+        before: splitLines(beforeText).slice(-(contextLines + 1)).join("\n"),
+        after: splitLines(afterText).slice(0, contextLines + 1).join("\n"),
       }
     }
 
@@ -979,7 +1033,9 @@ export namespace Serial {
     const triggerId = "trg_" + randomBytes(6).toString("hex")
     const trigger: Trigger = {
       id: triggerId,
-      response: input.response,
+      // Same eol normalization as write() — a u-boot break spam armed as
+      // "slp\r\n" reaches a \r-only board as "slp\r".
+      response: applyEol(input.response, session.eol),
       onPattern: input.onPattern ? new RegExp(input.onPattern) : undefined,
       untilPattern: input.untilPattern ? new RegExp(input.untilPattern) : undefined,
       maxFires: input.maxFires,

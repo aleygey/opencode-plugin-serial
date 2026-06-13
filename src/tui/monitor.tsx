@@ -74,7 +74,7 @@ const MAX_CANDIDATES = 50
 
 // `owner` appears once the server exposes it on Info (v0.3.0+); the driver
 // badge guards on its presence, so older servers degrade to no badge.
-type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string }
+type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string; eol?: string }
 
 // Discover the plugin's self-hosted /serial server. Order:
 //   1. OPENCODE_SERIAL_URL env (explicit override)
@@ -493,8 +493,10 @@ function useLiveTail(sessionId: () => string | undefined) {
   const schedule = () => {
     if (flushTimer === undefined) flushTimer = setTimeout(flush, FLUSH_MS)
   }
-  const ingest = (chunk: string) => {
-    pendingBytes += chunk.length
+  const ingest = (raw: string) => {
+    pendingBytes += raw.length // byte counter reflects RAW bytes received
+    // Treat \r\n and lone \r as line breaks (plain text view, not a terminal).
+    const chunk = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     const nl = chunk.lastIndexOf("\n")
     if (nl >= 0) {
       const after = chunk.slice(nl + 1)
@@ -675,7 +677,10 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
   }
   // Hot path: concat into a plain string and arm the timer. No signal write.
   const append = (chunk: string) => {
-    buffer += chunk
+    // Show \r-only and \r\n breaks as line breaks — this is a plain <text>
+    // block, not a real terminal, so a lone \r would otherwise pile output onto
+    // one wrapped line. Display normalization only.
+    buffer += chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     scheduleFlush()
   }
 
@@ -805,7 +810,10 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       warn("⚠ serial link not open — command NOT sent (kept in input)")
       return // keep the text so the user can retry
     }
-    ws!.send(line + eolOf(dev))
+    // Prefer the server-resolved eol on the session (matches what the agent
+    // write path uses); fall back to client devices.json match.path, then \r\n.
+    const eol = current()?.eol ?? eolOf(dev)
+    ws!.send(line + eol)
     if (line.trim()) history().push(line, "human")
     // Device echo normally shows the command in the stream; localEcho is for
     // echo-less consoles (would double-print on echoing devices).

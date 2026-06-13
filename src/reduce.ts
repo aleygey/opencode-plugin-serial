@@ -269,10 +269,15 @@ export function reduceLines(text: string, opts: ReduceOptions = {}): string {
 
   if (!dedup && !cycles && !normalize && !opts.exclude && !opts.include) return text
 
-  const hadTrailingNL = /\r?\n$/.test(text)
+  // A device that uses lone \r as its line break has no \n at all; treat \r as
+  // the newline so its real lines aren't fed to flattenCR below (which would
+  // collapse them as carriage-return OVERWRITES and eat the output). Operates on
+  // this display copy only — the raw ring buffer upstream is untouched.
+  const work = !text.includes("\n") && text.includes("\r") ? text.replace(/\r/g, "\n") : text
+  const hadTrailingNL = /\r?\n$/.test(work)
   // Split on LF, tolerate CRLF; keep a trailing \r on the last partial line out
   // of the split so an in-flight line isn't mangled.
-  const rawSplit = text.split("\n")
+  const rawSplit = work.split("\n")
   if (hadTrailingNL) rawSplit.pop() // drop empty tail produced by trailing \n
   let rawLines = rawSplit.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l))
 
