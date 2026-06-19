@@ -69,6 +69,12 @@ export function startSerialServer(opts: { base: string; port?: number }): Serial
     await Serial.write(SerialID.zod.parse(c.req.param("id")), String(body.data ?? ""))
     return c.json(true)
   })
+  // RAW hold: the monitor toggles this when the human enters/exits RAW mode so
+  // agent writes pause while they drive the device directly.
+  app.post("/serial/:id/rawhold", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { on?: boolean }
+    return c.json(Serial.setRawHold(SerialID.zod.parse(c.req.param("id")), !!body.on))
+  })
 
   const server = Bun.serve<WsData>({
     port: opts.port ?? 0, // 0 → OS picks a free port

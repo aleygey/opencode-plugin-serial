@@ -168,6 +168,8 @@ export namespace Serial {
     owner?: string
     leaseTimer?: ReturnType<typeof setInterval>
     logStream?: WriteStream
+    rawHold?: boolean // a human holds the monitor in RAW mode → pause agent writes
+    rawHoldTimer?: ReturnType<typeof setTimeout>
   }
 
   // WebSocket control frame: 0x00 + UTF-8 JSON.
@@ -197,6 +199,9 @@ export namespace Serial {
       // the monitor uses the SAME eol for human input as the write path uses for
       // the agent, instead of re-matching devices.json by path.
       eol: z.string().optional(),
+      // A human holds the monitor in RAW mode (driving the device directly) →
+      // agent writes are paused. Surfaced for the driver badge.
+      rawHold: z.boolean().optional(),
     })
     .meta({ ref: "Serial" })
 
@@ -314,6 +319,10 @@ export namespace Serial {
   function teardown(session: Active) {
     if (session.leaseTimer) clearInterval(session.leaseTimer)
     if (locks && session.deviceKey && session.owner) locks.release(session.deviceKey, session.owner)
+    if (session.rawHoldTimer) {
+      clearTimeout(session.rawHoldTimer)
+      session.rawHoldTimer = undefined
+    }
     if (session.logStream) {
       try {
         session.logStream.end()
@@ -793,6 +802,35 @@ export namespace Serial {
     return released
   }
 
+  // ── Raw hold (monitor RAW mode transiently seizes the device) ───────────────
+  // The human monitor sets this while in RAW mode so agent writes pause; it
+  // auto-releases after a timeout as a safety in case the monitor dies holding
+  // it (the human's own WS writes are never blocked — they have no owner).
+  export function setRawHold(id: SerialID, on: boolean): boolean {
+    const s = sessions.get(id)
+    if (!s) return false
+    if (s.rawHoldTimer) {
+      clearTimeout(s.rawHoldTimer)
+      s.rawHoldTimer = undefined
+    }
+    s.rawHold = on
+    s.info.rawHold = on
+    if (on) {
+      s.rawHoldTimer = setTimeout(() => {
+        const cur = sessions.get(id)
+        if (cur && cur.rawHold) {
+          cur.rawHold = false
+          cur.info.rawHold = false
+          cur.rawHoldTimer = undefined
+          emit("serial.updated", { info: cur.info })
+        }
+      }, 120_000)
+      s.rawHoldTimer.unref?.()
+    }
+    emit("serial.updated", { info: s.info })
+    return true
+  }
+
   // ── Auto-open (startup) ─────────────────────────────────────────────────────
   // Open every devices.json entry flagged autoOpen with a concrete match.path,
   // so /serial shows the session without waiting for the agent to serial_create.
@@ -904,9 +942,19 @@ export namespace Serial {
     })
   }
 
+  export class RawHeldError extends Error {
+    constructor() {
+      super("device is in RAW mode — a human is driving it directly; agent writes are paused until they exit raw")
+      this.name = "RawHeldError"
+    }
+  }
+
   export async function write(id: SerialID, data: string, owner?: string): Promise<void> {
     const session = sessions.get(id)
     if (session && session.info.status === "connected") {
+      // A human holding the monitor in RAW mode pauses AGENT writes (owner set).
+      // The human's own WS path (connect → port.write, no owner) is unaffected.
+      if (session.rawHold && owner) throw new RawHeldError()
       if (locks && session.deviceKey && owner) {
         // Re-acquire (not just check): refreshes our hold, blocks only a
         // DIFFERENT live owner, and re-grabs a lease that was force-released or
@@ -1170,6 +1218,8 @@ export namespace Serial {
   export async function arm(id: SerialID, input: ArmInput, owner?: string): Promise<string | undefined> {
     const session = sessions.get(id)
     if (!session) return undefined
+
+    if (session.rawHold && owner) throw new RawHeldError()
 
     // A trigger writes to the port, so it needs the lease just like write() —
     // re-acquire so an armed agent (re)takes the lease and a different live

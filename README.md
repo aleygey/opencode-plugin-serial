@@ -73,13 +73,35 @@ writes any text frame to the port verbatim).
 | key | action |
 | --- | --- |
 | `Enter` | send line + EOL (default `\r\n`, per-device via `devices.json` `eol`) |
-| `Tab` / `Shift+Tab` | complete the current token / cycle candidates |
+| `Tab` / `Shift+Tab` / `Ctrl+N` | LOCAL completion: current token / cycle candidates (Ctrl+N = shadow-proof) |
 | `↑` / `↓` | history (per-device, persisted, **shared with the agent** — `↑` recalls commands the agent ran too) |
 | `Ctrl+R` | reverse-i-search through history (bash-style) |
 | `Ctrl+C` / `Ctrl+G` | send `0x03` — interrupt the program on the DEVICE |
-| `Esc` | cancel completion/search → clear input → exit the view |
-| `[` `]` (input empty) / `F3` `F4` | switch session |
+| `PageUp` / `PageDown` | scroll the scrollback (20k lines); `Home`/`End` (input empty) = top / bottom-follow |
+| `/` (input empty) | incremental **find** over the scrollback; `↓`/`↑` next/prev match; `Esc` closes |
+| `F4` | toggle **RAW** passthrough (device-native completion/line-editing); `Esc` exits raw |
+| `Esc` | LAYERED, one level per press: raw → find → reverse-i-search → completion → clear input → exit view |
+| `[` `]` (input empty) / `F3` | switch session |
 | `Ctrl+U/K/W/A/E`, `Home/End`, arrows | line editing |
+
+### RAW mode (native device completion) — F4
+
+The local completion above never queries the device. When you specifically want
+the **device shell's own** completion (e.g. type a few chars of a script/dir name
++ Tab → the device completes it), press `F4` to enter RAW mode: every keystroke
+(incl. Tab, Ctrl-keys, arrows) is forwarded byte-for-byte and the device's echo
+renders in the view. RAW transiently **seizes the port** — the agent's writes are
+paused (server `rawHold`) while you drive — and `Esc` releases it (a 120s
+server-side backstop releases it too if the monitor dies). Not a full VT
+emulator (opentui has none): forward typing + unique completion render cleanly;
+cursor-addressed redraws / multi-column candidate menus may look rough.
+
+### Color & scrollback (v0.6.0)
+
+The view renders only the visible rows (cheap at any depth) with **device ANSI
+color** (16/256/truecolor) and **local keyword highlight** (error→red, warn→
+yellow by default; add rules per device via `devices.json` `highlight`). Scroll
+back through ~20k lines; new output auto-follows only while pinned to the bottom.
 
 **Completion never queries the device.** The serial line is a single shared
 channel that the agent pattern-matches (`serial_collect` / `serial_wait`) — a

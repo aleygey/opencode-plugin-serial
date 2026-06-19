@@ -1,59 +1,46 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "../vendor/tui"
-import { createSignal, createEffect, onCleanup, For, Show, batch } from "solid-js"
+import { createSignal, createMemo, createEffect, onCleanup, For, Index, Show, batch } from "solid-js"
 import { useKeyboard, useTerminalDimensions, usePaste } from "@opentui/solid"
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { parseLine, type Style } from "./ansi"
 
 /**
- * Serial monitor — TUI plugin.
+ * Serial monitor — TUI plugin (terminal view).
  *
- * Attaches to the plugin's OWN /serial server (not opencode core — core has no
- * serial in this standalone setup). It discovers the server's port from the
- * api.json the server writes, polls the session list, and streams a session's
- * bytes over the /serial/:id/connect WebSocket.
+ * Attaches to the plugin's OWN /serial server, discovers it via api.json, polls
+ * the session list, and streams a session's bytes over the WebSocket.
  *
- *   - app_bottom bar : a compact live status line per active session, rendered
- *     UNCONDITIONALLY at the bottom of the app frame — appears automatically the
- *     moment the agent calls serial_create.
- *   - sidebar block  : active sessions + status dot (only when the sidebar is
- *     shown — needs a session and width > 120 cols / manual toggle).
- *   - full-screen monitor (route "serial.monitor"): live byte stream (ONE text
- *     block, batched flush) + an INTERACTIVE INPUT LINE:
- *       · type a command, Enter sends it over the SAME WebSocket — the server's
- *         connect() onMessage writes any text frame to the port verbatim, so no
- *         new endpoint is needed. EOL defaults to "\r\n", per-device override
- *         via devices.json `eol`.
- *       · Tab completion from LOCAL sources only (command history / tokens
- *         already on screen / static dict + devices.json `commands`) — NEVER
- *         queries the device: the agent pattern-matches the same shared stream
- *         (serial_collect / serial_wait), and a hidden completion round-trip
- *         would pollute what it parses. To complete paths in a directory, `ls`
- *         it once — the output lands in the screen index.
- *       · ↑/↓ history (per-device JSON under ~/.opencode/serial/history/ —
- *         shared with the agent: Serial.write() mirrors agent commands there),
- *         ctrl+r reverse-i-search.
- *       · ctrl+c (and ctrl+g, see below) sends 0x03 — device interrupt.
- *       · escape: cancel completion/search → clear input → exit route.
- *       · [ / ] switch sessions while the input is empty; F3/F4 always.
+ *   - app_bottom bar : compact live status per session (auto-appears on create).
+ *   - sidebar block  : active sessions + status dot.
+ *   - full-screen monitor (route "serial.monitor"): a WINDOWED terminal view —
+ *     only the visible rows are rendered (cheap at any scrollback depth) with
+ *     ANSI/SGR color + local keyword highlight, plus:
+ *       · scrollback: PageUp/PageDown scroll; Home/End (when input empty) jump
+ *         top/bottom; new data auto-follows only when pinned to the bottom.
+ *       · find: "/" (input empty) opens incremental search; n / N jump to the
+ *         next / previous matching line; matched lines get a gutter marker.
+ *       · input line: type a command, Enter sends (per-device eol); Tab/Ctrl+N
+ *         LOCAL completion (history / on-screen tokens / dict); ↑↓ history;
+ *         Ctrl+R reverse-i-search; Ctrl+C/Ctrl+G send 0x03.
+ *       · RAW mode (F4): byte-for-byte passthrough so the DEVICE shell does
+ *         native completion/history/line-editing (type a few chars + Tab → the
+ *         device completes a unique name). Raw transiently seizes the port
+ *         (agent writes blocked via the server rawHold) and releases on Esc.
+ *         Caveat: this is NOT a full VT emulator (opentui has none) — forward
+ *         typing + unique completion render fine; cursor-addressed redraws /
+ *         multi-column candidate menus may look rough.
+ *       · escape is LAYERED (one level per press): raw → search → completion →
+ *         clear input → exit route. So Esc-to-exit-/serial stays the last stage.
  *
- * KEYMAP MODE: opencode's host keymap runs BEFORE plugin key handlers and, in
- * its base mode, owns tab (agent cycle) and ctrl+c/ctrl+d (app exit) even on a
- * plugin route. While this route is mounted we push a dedicated keymap mode
- * ("serial-terminal") — the same mechanism opencode dialogs use ('modal') — so
- * those keys fall through to this view; the mode is popped on unmount and the
- * modeless ctrl+x leader still works as the host escape hatch (ctrl+x q quits).
- * On older builds without api.mode the host keeps tab/ctrl+c: the hint line
- * says so and ctrl+g doubles as the interrupt key.
+ * KEYMAP MODE: while mounted we push a keymap mode so host base-mode keys (tab,
+ * ctrl+c) fall through; popped on unmount. Older builds without api.mode keep
+ * those host keys (hint says so; ctrl+g is the interrupt fallback).
  *
- * IMPORTANT (loading): this TUI module is loaded by opencode's TUI plugin
- * loader, which reads `tui.json`, NOT opencode.json. List the plugin in BOTH
- * configs (see INSTALL.md) or none of this renders.
- *
- * Key-event handling is based on the verified @opentui/core parse semantics
- * (0.1.99 ↔ 0.3.4 identical): see normalizeKey(). Only box/text/span JSX
- * elements are used; the line editor is hand-rolled on useKeyboard.
+ * Loaded by opencode's TUI plugin loader (reads tui.json, NOT opencode.json) —
+ * list the plugin in BOTH configs (see INSTALL.md).
  */
 
 const id = "serial-monitor"
@@ -61,27 +48,26 @@ const ROUTE = "serial.monitor"
 
 // Render tuning.
 const FLUSH_MS = 33 // ~30fps: coalesce bursty WS chunks into one render/frame
-const MAX_CHARS = 256 * 1024 // ring budget for the full-screen text block (~256KB)
-const BAR_MAX_SESSIONS = 4 // how many session lines the bottom bar shows
+const MAX_LINES = 20000 // scrollback depth (windowed render → cost is viewport-bound)
+const BAR_MAX_SESSIONS = 4
 
 // Input tuning.
 const HISTORY_CAP = 500
-const HISTORY_RELOAD_MS = 2000 // re-stat the history file at most this often
-const TOKEN_INDEX_TTL_MS = 2000 // screen-token index rebuilt at most this often
-const DEVICES_TTL_MS = 5000 // devices.json client cache
+const HISTORY_RELOAD_MS = 2000
+const TOKEN_INDEX_TTL_MS = 2000
+const DEVICES_TTL_MS = 5000
 const NOTICE_MS = 3000
 const MAX_CANDIDATES = 50
 
-// `owner` appears once the server exposes it on Info (v0.3.0+); the driver
-// badge guards on its presence, so older servers degrade to no badge.
-type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string; eol?: string }
+// Built-in local keyword highlight (applied when the device didn't color the
+// run itself). devices.json `highlight` can add more.
+const DEFAULT_HIGHLIGHT: Array<{ re: RegExp; color: string }> = [
+  { re: /\b(error|fail(ed|ure)?|panic|fatal|critical|oops|segfault|assert)\b/i, color: "#ef2929" },
+  { re: /\b(warn(ing)?)\b/i, color: "#fce94f" },
+]
 
-// Discover the plugin's self-hosted /serial server. Order:
-//   1. OPENCODE_SERIAL_URL env (explicit override)
-//   2. <cwd>/.opencode/serial/api.json     (TUI run from the worktree)
-//   3. <home>/.opencode/serial/api.json    (global fallback the server also
-//      writes — makes discovery work when the TUI's cwd != server worktree,
-//      and on Windows where process.env.HOME is unset)
+type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string; eol?: string; rawHold?: boolean }
+
 function readServerBase(): string | undefined {
   const env = process.env.OPENCODE_SERIAL_URL
   if (env) return env
@@ -95,14 +81,12 @@ function readServerBase(): string | undefined {
       if (info.url) return info.url
       if (typeof info.port === "number") return `http://127.0.0.1:${info.port}`
     } catch {
-      // try next candidate
+      // try next
     }
   }
   return undefined
 }
 
-// Poll the session list off the plugin server. (Core has no serial event bus in
-// the standalone setup, so we poll rather than subscribe.)
 function useSessions() {
   const [sessions, setSessions] = createSignal<Session[]>([])
   const refresh = async () => {
@@ -113,7 +97,7 @@ function useSessions() {
       const data = await res.json()
       if (Array.isArray(data)) setSessions(data as Session[])
     } catch {
-      // server not up yet / unreachable — keep last list
+      // keep last list
     }
   }
   void refresh()
@@ -129,19 +113,13 @@ function dotColor(theme: Record<string, any>, status: string) {
 }
 
 // ── devices.json (client-side, read-only) ────────────────────────────────────
-// Per-device INPUT options for the monitor. LIMITATION: client-side we only
-// know the session's `path`, not its USB descriptors, so only `match.path`
-// entries resolve here — add a path to entries whose eol/commands you want in
-// the monitor (the server matches by serialNumber/vid+pid independently).
 type DeviceEx = {
   name?: string
   match?: { path?: string }
-  /** Line terminator for sent commands: "cr" | "lf" | "crlf" | raw string. Default "\r\n". */
   eol?: string
-  /** Extra completion-dictionary entries (e.g. vendor CLI verbs). */
   commands?: string[]
-  /** Echo sent commands into the local view (for echo-less consoles). Default false. */
   localEcho?: boolean
+  highlight?: Array<{ pattern: string; color: string }>
 }
 let devCache: { at: number; list: DeviceEx[] } | undefined
 function readDevices(): DeviceEx[] {
@@ -159,7 +137,7 @@ function readDevices(): DeviceEx[] {
         break
       }
     } catch {
-      // try next candidate
+      // try next
     }
   }
   devCache = { at: now, list }
@@ -176,24 +154,20 @@ function eolOf(dev?: DeviceEx): string {
   if (e === "crlf") return "\r\n"
   return typeof e === "string" && e.length > 0 ? e : "\r\n"
 }
+function highlightRules(dev?: DeviceEx): Array<{ re: RegExp; color: string }> {
+  const extra: Array<{ re: RegExp; color: string }> = []
+  for (const h of dev?.highlight ?? []) {
+    try {
+      extra.push({ re: new RegExp(h.pattern, "i"), color: h.color })
+    } catch {
+      // bad pattern — skip
+    }
+  }
+  return [...extra, ...DEFAULT_HIGHLIGHT]
+}
 
-// ── Key normalization ────────────────────────────────────────────────────────
-// VERIFIED against @opentui/core parse.keypress / KeyHandler (0.1.99 and 0.3.4
-// are byte-identical here):
-//   - evt.sequence carries the literal typed text in BOTH the legacy and kitty
-//     parse paths (kitty puts the shifted char in sequence while name stays the
-//     base-layout key) — so SEQUENCE is the insertion source, never name.
-//     Named keys carry raw control sequences ("\r", "\x1b[A") which the
-//     charCode>=32 filter rejects, so they can't leak in as text.
-//   - enter arrives as name "return" ("\r"); a bare "\n" is "linefeed".
-//   - shift+tab arrives as name "tab" + shift:true (legacy "[Z" and kitty).
-//   - ctrl chords arrive as {name:"<letter>", ctrl:true}. Legacy terminals fold
-//     ctrl+m→return / ctrl+i→tab / ctrl+h→backspace (protocol ambiguity; kitty
-//     reports them distinctly).
-//   - bracketed paste NEVER arrives as a keypress — it is a single PasteEvent
-//     via usePaste (handled separately below).
+// ── Key normalization (for the line-editor / non-raw path) ───────────────────
 type NormKey = { char?: string; name: string; ctrl: boolean; shift: boolean }
-
 function normalizeKey(evt: any): NormKey {
   let name = typeof evt?.name === "string" ? evt.name : ""
   const ctrl = !!evt?.ctrl
@@ -219,6 +193,13 @@ function normalizeKey(evt: any): NormKey {
   return { char, name, ctrl, shift }
 }
 
+// The exact terminal bytes of a keypress, for RAW passthrough to the device.
+function rawBytes(evt: any): string {
+  if (typeof evt?.raw === "string" && evt.raw.length) return evt.raw
+  if (typeof evt?.sequence === "string" && evt.sequence.length) return evt.sequence
+  return ""
+}
+
 // ── Line editor (hand-rolled; spans only) ────────────────────────────────────
 function useLineEditor(opts: { onSubmit: (line: string) => void; onChange?: () => void }) {
   const [text, setTextSig] = createSignal("")
@@ -228,8 +209,6 @@ function useLineEditor(opts: { onSubmit: (line: string) => void; onChange?: () =
       setTextSig(s)
       setCursorSig(Math.max(0, Math.min(cur ?? s.length, s.length)))
     })
-
-  /** Returns true when the key was consumed by the editor. */
   const handleKey = (k: NormKey): boolean => {
     const t = text()
     const c = cursor()
@@ -242,24 +221,11 @@ function useLineEditor(opts: { onSubmit: (line: string) => void; onChange?: () =
       opts.onChange?.()
       return true
     }
-    if (k.name === "left" && !k.ctrl) {
-      set(t, c - 1)
-      return true
-    }
-    if (k.name === "right" && !k.ctrl) {
-      set(t, c + 1)
-      return true
-    }
-    if (k.name === "home" || (k.ctrl && k.name === "a")) {
-      set(t, 0)
-      return true
-    }
-    if (k.name === "end" || (k.ctrl && k.name === "e")) {
-      set(t, t.length)
-      return true
-    }
+    if (k.name === "left" && !k.ctrl) return (set(t, c - 1), true)
+    if (k.name === "right" && !k.ctrl) return (set(t, c + 1), true)
+    if (k.name === "home" || (k.ctrl && k.name === "a")) return (set(t, 0), true)
+    if (k.name === "end" || (k.ctrl && k.name === "e")) return (set(t, t.length), true)
     if (k.name === "backspace") {
-      // legacy ctrl+h folds into "backspace" upstream — same action either way
       if (c > 0) {
         set(t.slice(0, c - 1) + t.slice(c), c - 1)
         opts.onChange?.()
@@ -274,12 +240,12 @@ function useLineEditor(opts: { onSubmit: (line: string) => void; onChange?: () =
       return true
     }
     if (k.ctrl && k.name === "u") {
-      set(t.slice(c), 0) // kill to line start
+      set(t.slice(c), 0)
       opts.onChange?.()
       return true
     }
     if (k.ctrl && k.name === "k") {
-      set(t.slice(0, c), c) // kill to line end
+      set(t.slice(0, c), c)
       opts.onChange?.()
       return true
     }
@@ -296,14 +262,6 @@ function useLineEditor(opts: { onSubmit: (line: string) => void; onChange?: () =
   return { text, cursor, set, handleKey }
 }
 
-/**
- * Render the editor line with a block cursor, windowed around the cursor so
- * very long input stays visible. Returns an array of <span>s (no fragments —
- * fragments inside <text> are unproven in this opentui build).
- *
- * Cursor: the cell at the cursor is REPLACED by "█" — true inverse video needs
- * span `bg`, unverified here; swap once confirmed.
- */
 function renderWithCursor(t: string, c: number, width: number, theme: Record<string, any>) {
   const w = Math.max(8, width)
   let start = 0
@@ -315,49 +273,31 @@ function renderWithCursor(t: string, c: number, width: number, theme: Record<str
   if (end < t.length && vis.length > 1) vis = vis.slice(0, -1) + "…"
   const before = vis.slice(0, vc)
   const after = vc < vis.length ? vis.slice(vc + 1) : ""
-  return [
-    <span>{before}</span>,
-    <span style={{ fg: theme.success }}>█</span>,
-    <span>{after}</span>,
-  ]
+  return [<span>{before}</span>, <span style={{ fg: theme.success }}>█</span>, <span>{after}</span>]
 }
 
-// ── History store (per-device JSON file, shared with the agent) ──────────────
-// File: <home>/.opencode/serial/history/<sanitized-path>.json
-// Format: { version: 1, entries: [{ cmd, source: "human"|"agent", at }] }
-// The server's Serial.write() appends agent commands to the SAME file (same
-// sanitize rule, same format — service.ts appendSharedHistory), and this class
-// re-stats the file (throttled) so they become ↑-recallable live. Concurrent
-// writers are last-writer-wins (best-effort by design).
+// ── History store (per-device JSON, shared with the agent) ───────────────────
 type HistEntry = { cmd: string; source: "human" | "agent"; at: number }
-
 const HISTORY_DIR = path.join(os.homedir(), ".opencode", "serial", "history")
-
 class HistoryStore {
   private entries: HistEntry[] = []
   private file: string
   private mtime = 0
   private lastStat = 0
-
   constructor(key: string) {
     const safe = key.replace(/[^A-Za-z0-9._-]+/g, "_") || "default"
     this.file = path.join(HISTORY_DIR, `${safe}.json`)
     this.load()
   }
-
   private load() {
     try {
       this.mtime = statSync(this.file).mtimeMs
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as { entries?: HistEntry[] }
-      if (Array.isArray(raw.entries)) {
-        this.entries = raw.entries.filter((e) => e && typeof e.cmd === "string").slice(-HISTORY_CAP)
-      }
+      if (Array.isArray(raw.entries)) this.entries = raw.entries.filter((e) => e && typeof e.cmd === "string").slice(-HISTORY_CAP)
     } catch {
-      // missing/corrupt file — start empty
+      // empty
     }
   }
-
-  /** Pick up entries appended by the server's agent hook. Throttled. */
   private maybeReload() {
     const now = Date.now()
     if (now - this.lastStat < HISTORY_RELOAD_MS) return
@@ -366,67 +306,50 @@ class HistoryStore {
       const m = statSync(this.file).mtimeMs
       if (m !== this.mtime) this.load()
     } catch {
-      // file gone — keep memory copy
+      // keep memory
     }
   }
-
   push(cmd: string, source: "human" | "agent" = "human") {
     const c = cmd.replace(/[\r\n]+$/, "")
     if (!c.trim()) return
     this.maybeReload()
     const last = this.entries[this.entries.length - 1]
     if (last && last.cmd === c) {
-      last.at = Date.now() // consecutive dedup
+      last.at = Date.now()
       return
     }
     this.entries.push({ cmd: c, source, at: Date.now() })
     if (this.entries.length > HISTORY_CAP) this.entries = this.entries.slice(-HISTORY_CAP)
     this.save()
   }
-
-  /** Commands ordered oldest→newest (newest-LAST). */
   list(): string[] {
     this.maybeReload()
     return this.entries.map((e) => e.cmd)
   }
-
   private save() {
     try {
       mkdirSync(HISTORY_DIR, { recursive: true })
       writeFileSync(this.file, JSON.stringify({ version: 1, entries: this.entries }))
       this.mtime = statSync(this.file).mtimeMs
     } catch {
-      // read-only FS etc. — history stays in-memory for this run
+      // in-memory only
     }
   }
 }
 
-// ── Completion engine (LOCAL sources only — never queries the device) ────────
+// ── Completion engine (LOCAL sources only) ───────────────────────────────────
 const STATIC_DICT = [
-  // busybox-ish
   "ls", "cat", "cd", "echo", "cp", "mv", "rm", "mkdir", "mount", "umount",
   "insmod", "rmmod", "dmesg", "ps", "top", "kill", "reboot", "free", "df",
-  "ifconfig", "ping",
-  // u-boot
-  "printenv", "setenv", "saveenv", "boot", "run",
+  "ifconfig", "ping", "printenv", "setenv", "saveenv", "boot", "run",
 ]
-
 type CandSource = "history" | "screen" | "dict"
 type Cand = { text: string; source: CandSource }
-
 class CompletionEngine {
   private idxCache: { at: number; tokens: string[] } | undefined
-
   constructor(
-    private opts: {
-      history: () => string[] // newest-last
-      getText: () => string // the monitor's local received-byte buffer (≤256KB)
-      extraDict: () => string[] // devices.json commands?: string[]
-    },
+    private opts: { history: () => string[]; getText: () => string; extraDict: () => string[] },
   ) {}
-
-  /** Token index over the received output. Built lazily on Tab, TTL-cached so
-   *  a flooding stream cannot make Tab re-split 256KB on every press. */
   private screenTokens(): string[] {
     const now = Date.now()
     if (this.idxCache && now - this.idxCache.at < TOKEN_INDEX_TTL_MS) return this.idxCache.tokens
@@ -435,14 +358,6 @@ class CompletionEngine {
     this.idxCache = { at: now, tokens: [...seen] }
     return this.idxCache.tokens
   }
-
-  /**
-   * Candidates for `prefix` (current token up to the cursor), ranked
-   * history > screen > dict, deduped (first source wins). When the token is
-   * the whole line and a history command's first word matches, the FULL
-   * command is offered (recall-style). Path-like prefixes rank same-directory
-   * matches first (stable sort keeps source order within ranks).
-   */
   gather(prefix: string, tokenIsWholeLine: boolean): Cand[] {
     const out: Cand[] = []
     const seen = new Set<string>()
@@ -468,9 +383,7 @@ class CompletionEngine {
   }
 }
 
-// Attach a live-only WebSocket (cursor=-1, no replay) and track just the byte
-// count + last line, flushed at most once per FLUSH_MS. O(1) memory — used by
-// the compact status lines (bottom bar).
+// ── Live tail for the bottom bar ─────────────────────────────────────────────
 function useLiveTail(sessionId: () => string | undefined) {
   const [lastLine, setLastLine] = createSignal("")
   const [bytes, setBytes] = createSignal(0)
@@ -480,7 +393,6 @@ function useLiveTail(sessionId: () => string | undefined) {
   let pendingLine: string | undefined
   let flushTimer: ReturnType<typeof setTimeout> | undefined
   const dec = new TextDecoder()
-
   const flush = () => {
     flushTimer = undefined
     batch(() => {
@@ -494,8 +406,7 @@ function useLiveTail(sessionId: () => string | undefined) {
     if (flushTimer === undefined) flushTimer = setTimeout(flush, FLUSH_MS)
   }
   const ingest = (raw: string) => {
-    pendingBytes += raw.length // byte counter reflects RAW bytes received
-    // Treat \r\n and lone \r as line breaks (plain text view, not a terminal).
+    pendingBytes += raw.length
     const chunk = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     const nl = chunk.lastIndexOf("\n")
     if (nl >= 0) {
@@ -506,7 +417,6 @@ function useLiveTail(sessionId: () => string | undefined) {
     }
     schedule()
   }
-
   createEffect(() => {
     const sid = sessionId()
     if (!sid || connectedTo === sid) return
@@ -524,21 +434,18 @@ function useLiveTail(sessionId: () => string | undefined) {
         return
       }
       const arr = new Uint8Array(ev.data as ArrayBuffer)
-      if (arr[0] === 0x00) return // meta control frame { cursor }
+      if (arr[0] === 0x00) return
       ingest(dec.decode(arr))
     }
     ws = socket
   })
-
   onCleanup(() => {
     ws?.close()
     if (flushTimer !== undefined) clearTimeout(flushTimer)
   })
-
   return { lastLine, bytes }
 }
 
-// ── Bottom status bar (app_bottom) — auto-appears on serial_create ───────────
 function SessionLine(props: { api: TuiPluginApi; session: Session }) {
   const theme = () => props.api.theme.current
   const { lastLine, bytes } = useLiveTail(() => props.session.id)
@@ -572,7 +479,6 @@ function BottomBar(props: { api: TuiPluginApi }) {
   )
 }
 
-// ── Sidebar overview ─────────────────────────────────────────────────────────
 function Sidebar(props: { api: TuiPluginApi }) {
   const theme = () => props.api.theme.current
   const sessions = useSessions()
@@ -605,22 +511,19 @@ function Sidebar(props: { api: TuiPluginApi }) {
   )
 }
 
-// ── Full-screen monitor ──────────────────────────────────────────────────────
+// ── Full-screen terminal monitor ─────────────────────────────────────────────
+type Line = { text: string; start: Style } // text = raw line (may contain ANSI), no trailing \n
+
 function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> }) {
   const dim = useTerminalDimensions()
   const theme = () => props.api.theme.current
   const sessions = useSessions()
   const initial = typeof props.params?.serial_id === "string" ? (props.params.serial_id as string) : undefined
   const [activeId, setActiveId] = createSignal<string | undefined>(initial)
-  const current = () => {
-    const sid = activeId() ?? sessions()[0]?.id
-    return sessions().find((s) => s.id === sid)
-  }
+  const current = () => sessions().find((s) => s.id === (activeId() ?? sessions()[0]?.id))
 
-  // ── Keymap mode: release tab/ctrl+c from the host while we're mounted ─────
-  // api.mode.push exists on current opencode (plugin adapters); signature is
-  // tolerated loosely: push() returning a disposer, or push/pop pairs.
-  const [hostKeys, setHostKeys] = createSignal(false) // true → host still owns tab/ctrl+c
+  // Keymap mode: release tab/ctrl+c from the host while mounted.
+  const [hostKeys, setHostKeys] = createSignal(false)
   {
     let pop: (() => void) | undefined
     try {
@@ -638,9 +541,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
               } catch {}
             }
           }
-      } else {
-        setHostKeys(true)
-      }
+      } else setHostKeys(true)
     } catch {
       setHostKeys(true)
     }
@@ -651,38 +552,88 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     })
   }
 
-  // ── Stream rendering (ONE renderable, batched flush) ──────────────────────
-  const [text, setText] = createSignal("")
+  // ── Windowed line model ────────────────────────────────────────────────────
+  // `lines` is a plain array (NOT a signal — copying 20k items per flush is
+  // wasteful); a `version` counter triggers re-render. Only the visible window
+  // is rendered, so cost is bounded by viewport height regardless of depth.
+  let lines: Line[] = [{ text: "", start: {} }]
+  const [version, setVersion] = createSignal(0)
+  // anchorBottom = absolute index of the line shown at the viewport bottom.
+  // following = pinned to newest (auto-scroll on new data).
+  const [anchorBottom, setAnchorBottom] = createSignal(0)
+  const [following, setFollowing] = createSignal(true)
 
   let ws: WebSocket | undefined
   let connectedTo: string | undefined
-  let buffer = ""
+  let pending = ""
   let flushTimer: ReturnType<typeof setTimeout> | undefined
   const dec = new TextDecoder()
 
-  const trimToBudget = (s: string): string => {
-    if (s.length <= MAX_CHARS) return s
-    const cut = s.length - MAX_CHARS
-    const nl = s.indexOf("\n", cut)
-    return nl >= 0 ? s.slice(nl + 1) : s.slice(cut)
+  const viewportH = () => Math.max(1, dim().height - 8) // header + border + input chrome
+
+  const feed = (norm: string) => {
+    // norm already has \r\n / lone \r → \n (display line breaks); ANSI kept.
+    const parts = norm.split("\n")
+    let last = lines[lines.length - 1]!
+    last.text += parts[0]
+    for (let i = 1; i < parts.length; i++) {
+      const end = parseLine(last.text, last.start).end // carry SGR state across the closed line
+      lines.push({ text: parts[i]!, start: end })
+      last = lines[lines.length - 1]!
+    }
+    let dropped = 0
+    if (lines.length > MAX_LINES) {
+      dropped = lines.length - MAX_LINES
+      lines = lines.slice(dropped)
+    }
+    if (following()) setAnchorBottom(lines.length - 1)
+    else if (dropped) setAnchorBottom((a) => Math.max(0, a - dropped))
+    // Find matches hold ABSOLUTE line indices — rebuild them against the
+    // trimmed buffer so gutter markers + n/prev jumps stay correct.
+    if (dropped) {
+      const f = find()
+      if (f && f.query) setFind(runFind(f.query))
+    }
+  }
+
+  // True when `tail` (which starts at an ESC / C1 introducer) is an INCOMPLETE
+  // escape — so we hold it back across the flush boundary instead of mangling it.
+  const isIncompleteEscape = (tail: string): boolean => {
+    if (tail === "\x1b") return true
+    const c = tail[1]
+    if (c === "[") return !/^\x1b\[[0-9;:?<=>]*[@-~]/.test(tail)
+    if (c === "]") return !(tail.includes("\x07") || tail.includes("\x1b\\"))
+    return false // other 2-byte escape — both bytes already present
   }
 
   const flush = () => {
     flushTimer = undefined
-    buffer = trimToBudget(buffer)
-    batch(() => setText(buffer))
+    if (!pending) return
+    // Hold back a trailing incomplete ESC/CSI/OSC so a color escape split across
+    // the 33ms boundary completes on the next flush (give up past 64 held bytes
+    // so a stray lone ESC can't wedge the stream).
+    let s = pending
+    const esc = s.lastIndexOf("\x1b")
+    if (esc >= 0 && s.length - esc <= 64 && isIncompleteEscape(s.slice(esc))) {
+      pending = s.slice(esc)
+      s = s.slice(0, esc)
+    } else {
+      pending = ""
+    }
+    if (!s) return
+    feed(s.replace(/\r\n/g, "\n").replace(/\r/g, "\n"))
+    setVersion((v) => v + 1)
   }
   const scheduleFlush = () => {
     if (flushTimer === undefined) flushTimer = setTimeout(flush, FLUSH_MS)
   }
-  // Hot path: concat into a plain string and arm the timer. No signal write.
   const append = (chunk: string) => {
-    // Show \r-only and \r\n breaks as line breaks — this is a plain <text>
-    // block, not a real terminal, so a lone \r would otherwise pile output onto
-    // one wrapped line. Display normalization only.
-    buffer += chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    pending += chunk
     scheduleFlush()
   }
+
+  // Raw-mode passthrough also needs to SHOW the typed/echoed bytes; the device
+  // echo arrives over the same WS, so no special local echo is needed.
 
   const connect = (sid: string) => {
     if (connectedTo === sid && ws && ws.readyState <= 1) return
@@ -691,15 +642,15 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       clearTimeout(flushTimer)
       flushTimer = undefined
     }
-    buffer = ""
-    setText("")
+    lines = [{ text: "", start: {} }]
+    pending = ""
+    setFollowing(true)
+    setAnchorBottom(0)
+    setVersion((v) => v + 1)
     connectedTo = sid
     const base = readServerBase()
     if (!base) return
-    const wsBase = base.replace(/^http/, "ws")
-    // cursor=0 → replay the ring buffer first (history the agent produced
-    // before this monitor opened), then live data follows.
-    const socket = new WebSocket(`${wsBase}/serial/${sid}/connect?cursor=0`)
+    const socket = new WebSocket(`${base.replace(/^http/, "ws")}/serial/${sid}/connect?cursor=0`)
     socket.binaryType = "arraybuffer"
     socket.onmessage = (ev) => {
       if (typeof ev.data === "string") {
@@ -707,7 +658,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
         return
       }
       const arr = new Uint8Array(ev.data as ArrayBuffer)
-      if (arr[0] === 0x00) return // meta control frame { cursor }
+      if (arr[0] === 0x00) return
       append(dec.decode(arr))
     }
     ws = socket
@@ -717,15 +668,99 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     const sid = activeId() ?? sessions()[0]?.id
     if (sid) connect(sid)
   })
-
   onCleanup(() => {
     ws?.close()
     if (flushTimer !== undefined) clearTimeout(flushTimer)
+    void setRawHold(false, rawHeldSid)
   })
 
-  // ── Interactive input ──────────────────────────────────────────────────────
+  // ── Scroll ─────────────────────────────────────────────────────────────────
+  const scrollBy = (deltaLines: number) => {
+    const n = lines.length
+    const a = Math.max(0, Math.min(n - 1, anchorBottom() + deltaLines))
+    batch(() => {
+      setAnchorBottom(a)
+      setFollowing(a >= n - 1)
+    })
+  }
+  const scrollToTop = () =>
+    batch(() => {
+      const a = Math.min(lines.length - 1, viewportH() - 1)
+      setAnchorBottom(a)
+      setFollowing(a >= lines.length - 1) // a short buffer that fits → stay following
+    })
+  const scrollToBottom = () => batch(() => (setAnchorBottom(lines.length - 1), setFollowing(true)))
 
-  // Transient notice shown in the hint line (WS not open, no completions, …).
+  // ── Find (forward incremental search over the line buffer) ──────────────────
+  const [find, setFind] = createSignal<{ query: string; matches: number[]; idx: number } | undefined>(undefined)
+  const runFind = (query: string, preferFrom?: number): { query: string; matches: number[]; idx: number } => {
+    const matches: number[] = []
+    if (query) {
+      const q = query.toLowerCase()
+      for (let i = 0; i < lines.length; i++) if (lines[i]!.text.toLowerCase().includes(q)) matches.push(i)
+    }
+    // pick the match nearest-below the current view
+    let idx = matches.length - 1
+    const from = preferFrom ?? anchorBottom()
+    for (let i = 0; i < matches.length; i++) if (matches[i]! <= from) idx = i
+    return { query, matches, idx: matches.length ? Math.max(0, idx) : -1 }
+  }
+  const jumpToMatch = (st: { matches: number[]; idx: number }) => {
+    if (st.idx < 0 || !st.matches.length) return
+    const line = st.matches[st.idx]!
+    batch(() => {
+      setAnchorBottom(Math.min(lines.length - 1, line + Math.floor(viewportH() / 2)))
+      setFollowing(false)
+    })
+  }
+  const findStep = (dir: 1 | -1) => {
+    const st = find()
+    if (!st || !st.matches.length) return
+    const idx = (st.idx + dir + st.matches.length) % st.matches.length
+    const next = { ...st, idx }
+    setFind(next)
+    jumpToMatch(next)
+  }
+  // Memoized so the per-frame visible() render doesn't allocate a Set each flush;
+  // recomputes only when the find result changes.
+  const matchSet = createMemo(() => new Set(find()?.matches ?? []))
+
+  // ── Raw mode (transient native passthrough) ─────────────────────────────────
+  const [raw, setRaw] = createSignal(false)
+  // The session id that holds rawHold — captured at enter so the OFF always
+  // targets THAT session even if the user switched away (current() would return
+  // the new session and leak the old hold until the server's 120s backstop).
+  let rawHeldSid: string | undefined
+  const setRawHold = async (on: boolean, sid: string | undefined) => {
+    const base = readServerBase()
+    if (!base || !sid) return
+    try {
+      await fetch(`${base}/serial/${sid}/rawhold`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ on }),
+      })
+    } catch {
+      // best-effort; auto-releases server-side on a timeout
+    }
+  }
+  const enterRaw = () => {
+    if (!wsOpen()) {
+      warn("⚠ serial link not open — can't enter raw mode")
+      return
+    }
+    rawHeldSid = current()?.id
+    setRaw(true)
+    void setRawHold(true, rawHeldSid)
+  }
+  const exitRaw = () => {
+    setRaw(false)
+    const sid = rawHeldSid
+    rawHeldSid = undefined
+    void setRawHold(false, sid)
+  }
+
+  // ── Interactive input (non-raw) ──────────────────────────────────────────────
   const [notice, setNotice] = createSignal("")
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
   const warn = (msg: string) => {
@@ -737,8 +772,6 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     if (noticeTimer) clearTimeout(noticeTimer)
   })
 
-  // History: one store per device path, cached so [ ] switching keeps each
-  // device's history separate.
   const histCache = new Map<string, HistoryStore>()
   const history = (): HistoryStore => {
     const p = current()?.path ?? "default"
@@ -749,35 +782,22 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     }
     return h
   }
-
-  // History ↑/↓ navigation state. `draft` stashes the in-progress line when Up
-  // is first pressed; editing resets navigation (editor onChange).
   const [histIdx, setHistIdx] = createSignal<number | undefined>(undefined)
   let draft = ""
-
-  // Reverse-i-search (ctrl+r). While searching the editor is NOT modified —
-  // the input line just RENDERS the search UI — so escape restores trivially.
   const [search, setSearch] = createSignal<{ query: string; pos: number; failed: boolean } | undefined>(undefined)
-
-  // Completion state: snapshot of the line when Tab was first pressed, so
-  // cycling always rewrites from the original token.
   type Completion = { line0: string; cursor0: number; start: number; end: number; prefix: string; cands: Cand[]; i: number }
   const [comp, setComp] = createSignal<Completion | undefined>(undefined)
 
   const editor = useLineEditor({
     onSubmit: (line) => submit(line),
-    onChange: () => setHistIdx(undefined), // any edit invalidates history nav
+    onChange: () => setHistIdx(undefined),
   })
-
   const engine = new CompletionEngine({
     history: () => history().list(),
-    getText: () => buffer, // includes not-yet-flushed bytes
+    getText: () => lines.slice(-2000).map((l) => l.text).join("\n"),
     extraDict: () => deviceForPath(current()?.path)?.commands ?? [],
   })
 
-  // Reset per-session input state when the ATTACHED PATH changes. (Compare by
-  // path — the poll replaces the sessions array every 1.5s, so an effect keyed
-  // on the array object would wrongly reset completion/search on every poll.)
   let lastPath: string | undefined
   createEffect(() => {
     const p = current()?.path
@@ -787,53 +807,41 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     draft = ""
     setComp(undefined)
     setSearch(undefined)
+    if (raw()) exitRaw()
   })
 
   const wsOpen = () => !!ws && ws.readyState === 1
-
-  /** Raw passthrough (ctrl+c / ctrl+g → 0x03). Never touches local input. */
   const sendRaw = (s: string) => {
+    if (!s) return
     if (!wsOpen()) {
       warn("⚠ serial link not open — byte dropped")
       return
     }
     ws!.send(s)
   }
-
-  /** Enter: send line + per-device EOL over the existing monitor WS. The
-   *  server's connect() onMessage writes the frame to the port verbatim.
-   *  Human input intentionally bypasses the device lease — the human outranks
-   *  agents — which works because this WS path has no lock check. */
   const submit = (line: string) => {
     const dev = deviceForPath(current()?.path)
     if (!wsOpen()) {
       warn("⚠ serial link not open — command NOT sent (kept in input)")
-      return // keep the text so the user can retry
+      return
     }
-    // Prefer the server-resolved eol on the session (matches what the agent
-    // write path uses); fall back to client devices.json match.path, then \r\n.
     const eol = current()?.eol ?? eolOf(dev)
     ws!.send(line + eol)
     if (line.trim()) history().push(line, "human")
-    // Device echo normally shows the command in the stream; localEcho is for
-    // echo-less consoles (would double-print on echoing devices).
     if (dev?.localEcho) append(line + "\n")
     editor.set("", 0)
     setHistIdx(undefined)
     draft = ""
   }
 
-  // ── History navigation ────────────────────────────────────────────────────
   const histUp = () => {
     const list = history().list()
     if (!list.length) return
     let i = histIdx()
     if (i === undefined) {
-      draft = editor.text() // stash in-progress line on first Up
+      draft = editor.text()
       i = list.length - 1
-    } else if (i > 0) {
-      i -= 1
-    }
+    } else if (i > 0) i -= 1
     setHistIdx(i)
     const cmd = list[i]!
     editor.set(cmd, cmd.length)
@@ -844,7 +852,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     if (i === undefined) return
     if (i >= list.length - 1) {
       setHistIdx(undefined)
-      editor.set(draft, draft.length) // restore draft past the newest entry
+      editor.set(draft, draft.length)
       return
     }
     setHistIdx(i + 1)
@@ -852,8 +860,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     editor.set(cmd, cmd.length)
   }
 
-  // ── Reverse-i-search ──────────────────────────────────────────────────────
-  const findMatch = (q: string, from: number): number => {
+  const findHistMatch = (q: string, from: number): number => {
     if (!q) return -1
     const list = history().list()
     for (let i = Math.min(from, list.length - 1); i >= 0; i--) if (list[i]!.includes(q)) return i
@@ -863,37 +870,32 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     const st = search()!
     const list = history().list()
     if (k.ctrl && k.name === "r") {
-      // step to the next OLDER match
       const from = st.pos >= 0 ? st.pos - 1 : list.length - 1
-      const p = findMatch(st.query, from)
+      const p = findHistMatch(st.query, from)
       setSearch(p >= 0 ? { query: st.query, pos: p, failed: false } : { ...st, failed: true })
       return
     }
-    if (k.name === "escape") {
-      setSearch(undefined) // editor untouched → draft preserved
-      return
-    }
+    if (k.name === "escape") return setSearch(undefined)
     if (k.name === "return") {
       if (st.pos >= 0) {
         const m = list[st.pos]!
-        editor.set(m, m.length) // accept into editor; user reviews, then Enter sends
+        editor.set(m, m.length)
       }
       setSearch(undefined)
       return
     }
     if (k.name === "backspace") {
       const q = st.query.slice(0, -1)
-      const p = findMatch(q, list.length - 1)
+      const p = findHistMatch(q, list.length - 1)
       setSearch({ query: q, pos: p, failed: q.length > 0 && p < 0 })
       return
     }
     if (k.char !== undefined) {
       const q = st.query + k.char
-      const p = findMatch(q, st.pos >= 0 ? st.pos : list.length - 1)
+      const p = findHistMatch(q, st.pos >= 0 ? st.pos : list.length - 1)
       setSearch({ query: q, pos: p, failed: p < 0 })
       return
     }
-    // any other key: accept current match and leave search mode
     if (st.pos >= 0) {
       const m = list[st.pos]!
       editor.set(m, m.length)
@@ -901,16 +903,14 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     setSearch(undefined)
   }
 
-  // ── Completion ────────────────────────────────────────────────────────────
   const applyCand = (st: Completion) => {
     const cand = st.cands[st.i]!.text
-    const line = st.line0.slice(0, st.start) + cand + st.line0.slice(st.end)
-    editor.set(line, st.start + cand.length)
+    editor.set(st.line0.slice(0, st.start) + cand + st.line0.slice(st.end), st.start + cand.length)
   }
   const cancelCompletion = () => {
     const st = comp()
     if (!st) return
-    editor.set(st.line0, st.cursor0) // restore pre-completion line
+    editor.set(st.line0, st.cursor0)
     setComp(undefined)
   }
   const onTab = (back: boolean) => {
@@ -924,62 +924,56 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     }
     const line = editor.text()
     const cur = editor.cursor()
-    // token under cursor: whitespace-delimited
     let start = cur
     while (start > 0 && !/\s/.test(line[start - 1]!)) start--
     let end = cur
     while (end < line.length && !/\s/.test(line[end]!)) end++
     const prefix = line.slice(start, cur)
-    if (!prefix) {
-      warn("nothing to complete")
-      return
-    }
-    const tokenIsWholeLine = start === 0 && end === line.length
-    const cands = engine.gather(prefix, tokenIsWholeLine)
-    if (!cands.length) {
-      warn(`no completion for "${prefix}" — try ls'ing the directory first`)
-      return
-    }
+    if (!prefix) return warn("nothing to complete")
+    const cands = engine.gather(prefix, start === 0 && end === line.length)
+    if (!cands.length) return warn(`no completion for "${prefix}" — F4 for the device's own completion`)
     const st2: Completion = { line0: line, cursor0: cur, start, end, prefix, cands, i: 0 }
     applyCand(st2)
-    if (cands.length > 1) setComp(st2) // single match commits immediately
+    if (cands.length > 1) setComp(st2)
   }
 
-  // ── Paste (bracketed paste arrives as ONE PasteEvent, not keypresses) ─────
+  // ── Paste ────────────────────────────────────────────────────────────────────
   usePaste((event: any) => {
     if (props.api.route.current.name !== ROUTE) return
-    if (search()) return // pasting into the search query is not supported
     try {
       let s = ""
       if (event?.bytes instanceof Uint8Array) s = new TextDecoder().decode(event.bytes)
       else if (typeof event?.text === "string") s = event.text
-      // Single-line editor: flatten newlines, strip control bytes. (Sending a
-      // multi-line paste straight to a serial console would execute each line
-      // blind — flattening is the safe default.)
+      if (!s) return
+      event?.preventDefault?.()
+      if (raw()) {
+        sendRaw(s) // raw mode: paste straight to the device
+        return
+      }
+      if (search()) return
       const flat = s.replace(/[\r\n]+/g, " ").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim()
       if (!flat) return
-      event?.preventDefault?.()
       const t = editor.text()
       const c = editor.cursor()
       editor.set(t.slice(0, c) + flat + t.slice(c), c + flat.length)
       setHistIdx(undefined)
     } catch {
-      // malformed paste event — ignore
+      // ignore
     }
   })
 
-  // ── Hint line ─────────────────────────────────────────────────────────────
+  // ── Hint line ────────────────────────────────────────────────────────────────
   const hint = () => {
     if (notice()) return notice()
+    if (raw()) return "RAW · keys → device (Tab = device completion) · Esc exit raw"
+    const f = find()
+    if (f) return `/${f.query}  ${f.matches.length ? `${f.idx + 1}/${f.matches.length}` : "no match"} · ↓↑ next/prev · esc done`
     const st = comp()
     if (st) {
       const c = st.cands[st.i]!
       const n = st.cands.length
       const w0 = Math.max(0, Math.min(st.i - 1, n - 4))
-      const inline = st.cands
-        .slice(w0, w0 + 4)
-        .map((x, j) => (w0 + j === st.i ? `[${x.text}]` : x.text))
-        .join("  ")
+      const inline = st.cands.slice(w0, w0 + 4).map((x, j) => (w0 + j === st.i ? `[${x.text}]` : x.text)).join("  ")
       return `↹ ${st.i + 1}/${n}: ${c.text} (${c.source})  ${inline}${n > w0 + 4 ? " …" : ""}`
     }
     if (search()) return "ctrl+r older · enter accept · esc cancel"
@@ -987,38 +981,84 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     return ""
   }
 
-  // ── Key routing ───────────────────────────────────────────────────────────
+  // ── Key routing ──────────────────────────────────────────────────────────────
   useKeyboard((evt) => {
     if (props.api.route.current.name !== ROUTE) return
-    const k = normalizeKey(evt)
     const consume = () => {
       evt.preventDefault()
       evt.stopPropagation()
     }
+    const k = normalizeKey(evt)
 
-    // 1. ctrl+c / ctrl+g → device interrupt, ALWAYS (even during search).
-    //    ctrl+c reaches us only with the keymap mode pushed; ctrl+g works on
-    //    any build. Never clears local input.
+    // F4 toggles raw mode (works in any sub-state).
+    if (k.name === "f4") {
+      consume()
+      raw() ? exitRaw() : enterRaw()
+      return
+    }
+
+    // RAW: forward exact bytes to the device; Esc exits raw (one Esc = one level).
+    if (raw()) {
+      consume()
+      if (k.name === "escape") {
+        exitRaw()
+        return
+      }
+      sendRaw(rawBytes(evt))
+      return
+    }
+
+    // ctrl+c / ctrl+g → device interrupt.
     if (k.ctrl && (k.name === "c" || k.name === "g")) {
       consume()
       sendRaw("\x03")
       return
     }
 
-    // 2. reverse-i-search mode swallows everything else
+    // Find mode (over the scrollback) swallows keys. Navigation is on the ARROW
+    // keys (and Enter) so every printable char — including 'n' (kernel, panic,
+    // connect…) — flows into the query.
+    if (find()) {
+      consume()
+      const st = find()!
+      if (k.name === "escape") {
+        setFind(undefined)
+        return
+      }
+      if (k.name === "down" || k.name === "return") {
+        findStep(1)
+        return
+      }
+      if (k.name === "up") {
+        findStep(-1)
+        return
+      }
+      if (k.name === "backspace") {
+        const next = runFind(st.query.slice(0, -1))
+        setFind(next)
+        jumpToMatch(next)
+        return
+      }
+      if (k.char !== undefined) {
+        const next = runFind(st.query + k.char)
+        setFind(next)
+        jumpToMatch(next)
+        return
+      }
+      return
+    }
+
+    // reverse-i-search (history) swallows keys.
     if (search()) {
       consume()
       handleSearchKey(k)
       return
     }
 
-    // 3. escape — 3-stage: cancel completion → clear input → exit route
+    // escape — layered: completion → clear input → exit route.
     if (k.name === "escape") {
       consume()
-      if (comp()) {
-        cancelCompletion()
-        return
-      }
+      if (comp()) return cancelCompletion()
       if (editor.text().length > 0) {
         editor.set("", 0)
         setHistIdx(undefined)
@@ -1028,31 +1068,49 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       return
     }
 
-    // 4. ctrl+r enters search
+    // scrollback — PageUp/PageDown always; Home/End only when the input is empty
+    // (so they stay line-editor keys while typing).
+    if (k.name === "pageup") {
+      consume()
+      scrollBy(-viewportH())
+      return
+    }
+    if (k.name === "pagedown") {
+      consume()
+      scrollBy(viewportH())
+      return
+    }
+    if ((k.name === "home" || k.name === "end") && editor.text() === "") {
+      consume()
+      k.name === "home" ? scrollToTop() : scrollToBottom()
+      return
+    }
+
+    // ctrl+r → reverse-i-search (history).
     if (k.ctrl && k.name === "r") {
       consume()
       setSearch({ query: "", pos: -1, failed: false })
       return
     }
 
-    // 5. tab / shift+tab — completion cycling. Ctrl+N is a shadow-proof backup:
-    //    the /serial command registers keybind:"tab" to OPEN the monitor, and if
-    //    a given opencode build doesn't suppress that command binding inside the
-    //    route (keymap-mode dependent, unverified), Tab here could be eaten by
-    //    the host before this handler runs — Ctrl+N always reaches us.
+    // tab / ctrl+n → local completion.
     if (k.name === "tab" || (k.ctrl && k.name === "n")) {
       consume()
-      onTab(k.shift) // shift+tab cycles back; ctrl+n forward-only
+      onTab(k.shift)
       return
     }
-    // Any other key COMMITS the currently selected candidate (its text is
-    // already in the editor) and proceeds.
     const hadComp = comp() !== undefined
     if (hadComp) setComp(undefined)
 
-    // 6. session switching: [ / ] only while the input is empty (they are
-    //    typeable characters); F3/F4 always work. (F2 is the host's
-    //    model-cycle key in base mode — avoided entirely.)
+    // "/" opens find over the scrollback (only when the input is empty).
+    if (k.char === "/" && editor.text() === "") {
+      consume()
+      const st = runFind("")
+      setFind(st)
+      return
+    }
+
+    // session switching: [ / ] when input empty; F3 always.
     const cycle = (dir: 1 | -1) => {
       const list = sessions()
       if (!list.length) return
@@ -1060,19 +1118,23 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       const idx = Math.max(0, list.findIndex((s) => s.id === cur))
       setActiveId(list[(idx + dir + list.length) % list.length]?.id)
     }
-    if (k.name === "f4" || (k.char === "]" && editor.text() === "")) {
+    if (k.name === "f3") {
       consume()
       cycle(1)
       return
     }
-    if (k.name === "f3" || (k.char === "[" && editor.text() === "")) {
+    if (k.char === "]" && editor.text() === "") {
+      consume()
+      cycle(1)
+      return
+    }
+    if (k.char === "[" && editor.text() === "") {
       consume()
       cycle(-1)
       return
     }
 
-    // 7. up/down — history (right after a completion commit they only consume,
-    //    so the just-completed line isn't clobbered)
+    // up/down — history.
     if (k.name === "up") {
       consume()
       if (!hadComp) histUp()
@@ -1084,17 +1146,51 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       return
     }
 
-    // 8. line editor: printables, arrows, home/end, backspace/delete,
-    //    ctrl+u/k/w/a/e, enter→submit
+    // line editor.
     if (editor.handleKey(k)) {
       consume()
       return
     }
-    // unhandled → fall through (leader ctrl+x etc. keep working)
   })
 
-  // ── View ──────────────────────────────────────────────────────────────────
-  const inputWidth = () => Math.max(8, dim().width - 8) // container padding + "❯ " + slack
+  // ── Render one scrollback line → spans (ANSI color + keyword highlight) ──────
+  const renderLineSpans = (line: Line, dev?: DeviceEx) => {
+    const { runs } = parseLine(line.text, line.start)
+    const rules = highlightRules(dev)
+    // line-level keyword color, applied only to runs the device left uncolored
+    let kw: string | undefined
+    for (const r of rules) {
+      r.re.lastIndex = 0
+      if (r.re.test(line.text)) {
+        kw = r.color
+        break
+      }
+    }
+    const t = theme()
+    if (!runs.length) return [<span> </span>]
+    return runs.map((run) => {
+      const fg = run.style.reverse ? run.style.bg ?? t.backgroundPanel : run.style.fg ?? kw
+      const bg = run.style.reverse ? run.style.fg ?? t.text : run.style.bg
+      const style: Record<string, any> = {}
+      if (fg) style.fg = fg
+      if (bg) style.bg = bg
+      return <span style={style}>{run.text}</span>
+    })
+  }
+
+  const visible = () => {
+    void version() // re-render trigger
+    const n = lines.length
+    const end = Math.min(n, anchorBottom() + 1)
+    const start = Math.max(0, end - viewportH())
+    const dev = deviceForPath(current()?.path)
+    const set = matchSet()
+    const out: Array<{ spans: any; match: boolean }> = []
+    for (let i = start; i < end; i++) out.push({ spans: renderLineSpans(lines[i]!, dev), match: set.has(i) })
+    return out
+  }
+
+  const inputWidth = () => Math.max(8, dim().width - 8)
 
   return (
     <box
@@ -1110,62 +1206,71 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       <box flexDirection="row" justifyContent="space-between" paddingBottom={1}>
         <text fg={theme().text}>
           <b>Serial Monitor</b>
-          <Show when={activeId() ?? sessions()[0]?.id}>
-            <span style={{ fg: theme().textMuted }}> {activeId() ?? sessions()[0]?.id}</span>
+          <Show when={current()?.id}>
+            <span style={{ fg: theme().textMuted }}> {current()?.id}</span>
           </Show>
-          {/* Driver badge — who currently holds the device lease. Human input
-              bypasses the lease (humans outrank agents); the badge keeps the
-              two-writers situation visible instead of surprising. */}
-          <Show when={current()?.owner}>
-            <span style={{ fg: theme().warning ?? theme().textMuted }}>
-              {" "}· driver: agent {(current()?.owner ?? "").slice(0, 12)}
-            </span>
+          <Show when={raw()}>
+            <span style={{ fg: theme().error ?? theme().warning }}> · RAW (you drive)</span>
+          </Show>
+          <Show when={!raw() && current()?.owner}>
+            <span style={{ fg: theme().warning ?? theme().textMuted }}> · driver: agent {(current()?.owner ?? "").slice(0, 12)}</span>
+          </Show>
+          <Show when={!following()}>
+            <span style={{ fg: theme().textMuted }}> · scrolled (End↓)</span>
           </Show>
         </text>
-        <text fg={theme().textMuted}>tab/^N complete · ↑↓ history · ^R search · ^C intr · [ ]/F3 F4 switch · esc exit</text>
+        <text fg={theme().textMuted}>PgUp/Dn scroll · / find · F4 raw · ↑↓ hist · ^R · [ ]/F3 switch · esc</text>
       </box>
       <Show
         when={sessions().length > 0}
-        fallback={
-          <text fg={theme().textMuted}>No active serial sessions. Ask the agent to open one with serial_create.</text>
-        }
+        fallback={<text fg={theme().textMuted}>No active serial sessions. Ask the agent to open one with serial_create.</text>}
       >
-        <box border borderColor={theme().border} flexGrow={1} paddingLeft={1} paddingRight={1}>
-          {/* ONE renderable holding the whole (bounded) block. */}
-          <text fg={theme().text} wrapMode="word">
-            {text()}
-          </text>
+        <box border borderColor={raw() ? theme().error ?? theme().border : theme().border} flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1}>
+          {/* Only the visible window is rendered. <Index> keys by POSITION (a
+              fixed-height viewport) and passes each row as a signal, so a flush
+              patches changed cells instead of remounting every row. */}
+          <Index each={visible()}>
+            {(row) => (
+              <text fg={theme().text} wrapMode="word">
+                <Show when={row().match}>
+                  <span style={{ fg: theme().warning ?? theme().success }}>▸ </span>
+                </Show>
+                {row().spans}
+              </text>
+            )}
+          </Index>
         </box>
       </Show>
 
-      {/* ── Input area — separate renderables: flooding output never repaints
-            these except through their own signals ── */}
       <box flexDirection="column" flexShrink={0}>
         <Show when={hint()}>
           <text fg={theme().textMuted}>{hint()}</text>
         </Show>
-        <text fg={theme().text}>
-          <Show when={!search()}>
-            <span style={{ fg: theme().success }}>{"❯ "}</span>
-            {renderWithCursor(editor.text(), editor.cursor(), inputWidth(), theme())}
-          </Show>
-          <Show when={search()}>
-            {(() => {
-              const st = search()
-              if (!st) return <span />
-              const list = history().list()
-              const m = st.pos >= 0 ? list[st.pos]! : ""
-              return [
-                <span style={{ fg: theme().textMuted }}>
-                  {st.failed ? "(failed reverse-i-search)`" : "(reverse-i-search)`"}
-                </span>,
-                <span>{st.query}</span>,
-                <span style={{ fg: theme().textMuted }}>{"`: "}</span>,
-                <span>{m}</span>,
-              ]
-            })()}
-          </Show>
-        </text>
+        <Show when={!raw()}>
+          <text fg={theme().text}>
+            <Show when={!search()}>
+              <span style={{ fg: theme().success }}>{"❯ "}</span>
+              {renderWithCursor(editor.text(), editor.cursor(), inputWidth(), theme())}
+            </Show>
+            <Show when={search()}>
+              {(() => {
+                const st = search()
+                if (!st) return <span />
+                const list = history().list()
+                const m = st.pos >= 0 ? list[st.pos]! : ""
+                return [
+                  <span style={{ fg: theme().textMuted }}>{st.failed ? "(failed reverse-i-search)`" : "(reverse-i-search)`"}</span>,
+                  <span>{st.query}</span>,
+                  <span style={{ fg: theme().textMuted }}>{"`: "}</span>,
+                  <span>{m}</span>,
+                ]
+              })()}
+            </Show>
+          </text>
+        </Show>
+        <Show when={raw()}>
+          <text fg={theme().error ?? theme().warning}>{"▮ RAW — typing goes straight to the device · Esc to exit"}</text>
+        </Show>
       </box>
     </box>
   )
@@ -1175,11 +1280,9 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: 300,
     slots: {
-      // Compact live status, bottom of the app frame — auto-appears on create.
       app_bottom() {
         return <BottomBar api={api} />
       },
-      // Sidebar block (only visible when the sidebar is shown).
       sidebar_content() {
         return <Sidebar api={api} />
       },
@@ -1199,11 +1302,6 @@ const tui: TuiPlugin = async (api) => {
       value: "serial.monitor.open",
       category: "Serial",
       slash: { name: "serial" },
-      // Repurpose Tab (host default = agent.cycle, low-value here) to open the
-      // serial monitor. Inside the monitor route this binding is suppressed by
-      // the keymap mode the route pushes, so Tab there stays completion. If a
-      // given opencode build doesn't honor a plugin command keybind over the
-      // built-in agent.cycle, rebind in opencode keybinds config (or use /serial).
       keybind: "tab",
       onSelect: () => api.route.navigate(ROUTE, {}),
     },

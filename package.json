@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-plugin-serial",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "opencode plugin: serial-port tools (serial_*) + live TUI monitor with an interactive input line (tab completion, history, reverse-i-search). Open/read/write serial devices, server-side reactive triggers (e.g. u-boot break), server-side log de-noising (dedup/cycles/normalize/digest), a device map + per-device lease (one writer, many observers), an auto-appearing bottom status bar, and a shared session the agent and user both watch over a self-hosted /serial WebSocket. Standalone — no opencode core changes.",
   "type": "module",
   "license": "MIT",

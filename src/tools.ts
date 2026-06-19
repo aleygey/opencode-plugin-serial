@@ -28,6 +28,9 @@ const ownerOf = (ctx?: ToolContext) => ctx?.sessionID
 const isLockError = (e: unknown): e is { holder: { owner: string; acquiredAt: number; pid: number }; message: string } =>
   !!e && typeof e === "object" && (e as { name?: string }).name === "SerialLockError"
 
+const isRawHeld = (e: unknown): e is { message: string } =>
+  !!e && typeof e === "object" && (e as { name?: string }).name === "RawHeldError"
+
 // Build a ReduceOptions from the shared read-tool flags (or undefined if none).
 function reduceOptsOf(p: {
   dedup?: boolean
@@ -176,6 +179,7 @@ export const serialTools: Record<string, ToolDefinition> = {
         await Serial.write(id, interpreted, ownerOf(context))
       } catch (e) {
         if (isLockError(e)) return { output: e.message, metadata: { title: "locked", serialID: id, locked: true, holder: e.holder } }
+        if (isRawHeld(e)) return { output: e.message, metadata: { title: "raw mode (human driving)", serialID: id, rawHeld: true } }
         throw e
       }
       return {
@@ -253,6 +257,7 @@ export const serialTools: Record<string, ToolDefinition> = {
           await Serial.write(id, interpreted, ownerOf(context))
         } catch (e) {
           if (isLockError(e)) return { output: e.message, metadata: { title: "locked", serialID: id, locked: true, holder: e.holder } }
+          if (isRawHeld(e)) return { output: e.message, metadata: { title: "raw mode (human driving)", serialID: id, rawHeld: true } }
           throw e
         }
       }
@@ -567,6 +572,7 @@ export const serialTools: Record<string, ToolDefinition> = {
         )
       } catch (e) {
         if (isLockError(e)) return { output: e.message, metadata: { title: "locked", serialID: id, locked: true, holder: e.holder } }
+        if (isRawHeld(e)) return { output: e.message, metadata: { title: "raw mode (human driving)", serialID: id, rawHeld: true } }
         throw e
       }
       if (!triggerId) {
