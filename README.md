@@ -210,6 +210,39 @@ The Serial Monitor command registers `Tab` (repurposing the low-value host
 plugin command's keybind win over the built-in `agent.cycle`, rebind it in your
 opencode keybinds config, or just use `/serial`.
 
+### Encoding, telnet & logging (v0.5.0)
+
+**Corruption fix:** the drivers now decode serial input with a *streaming*
+decoder, so a multibyte UTF-8 char split across read boundaries (the "◆◆
+mid-word" garbage) no longer corrupts. For genuinely non-UTF-8 / binary
+consoles set a per-device `encoding`:
+
+```jsonc
+{ "name": "board", "match": { "path": "COM3" }, "encoding": "latin1" }
+// "utf8" (default, streaming) | "latin1" | "binary"  (latin1/binary = 1:1 byte passthrough, never corrupts)
+```
+
+**Telnet** — point a device at a TCP console (terminal server, ser2net, QEMU)
+with a `telnet://` path; everything else (sessions, lease, monitor, agent tools)
+works identically:
+
+```jsonc
+{ "name": "rack-A", "match": { "path": "telnet://10.0.0.5:23" }, "eol": "crlf", "autoOpen": true }
+```
+or `serial_create({ path: "telnet://10.0.0.5:23" })`. (No NAPI — runs directly
+under Bun/Node, bypassing the serialport helper. IAC negotiation + TCP keepalive
+handled in the driver.)
+
+**Session logging** — set `"log": true` on a device (or `serial_create({ log:
+true })`) to tee the complete, unbounded raw output to
+`<base>/logs/<path>-<id>.log` (the 2MB ring buffer is for live/agent reads; the
+file is the full record). Byte-exact for latin1/binary sessions.
+
+**Agent sees clean text** — raw ANSI/color bytes stay in the ring buffer and the
+WebSocket (so the monitor can render color), but the agent-facing reads
+(`serial_read_recent`/`collect`/`grep`/`digest`/`wait`) strip ANSI + control
+bytes, so a colored `error` still matches and escapes don't waste tokens.
+
 ### win-console panel (v0.4.0)
 
 With `winConsole` set, the plugin appears in win-console as a panel showing
