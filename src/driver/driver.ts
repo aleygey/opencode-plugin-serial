@@ -26,6 +26,10 @@ export type SerialOpts = {
   stopBits?: number
   parity?: "none" | "even" | "odd" | "mark" | "space"
   flowControl?: boolean
+  /** Inbound byte decoding. "utf8" (default) decodes streaming so multibyte
+   *  chars split across chunks aren't corrupted; "latin1" / "binary" map every
+   *  byte 1:1 and never emit replacement chars (for non-UTF-8 / binary consoles). */
+  encoding?: "utf8" | "latin1" | "binary"
 }
 
 export type SerialPort = {

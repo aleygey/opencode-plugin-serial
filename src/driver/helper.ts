@@ -38,6 +38,8 @@
 // spawns node with that node_modules visible.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const sp = require("serialport") as typeof import("serialport")
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { StringDecoder } = require("node:string_decoder") as typeof import("node:string_decoder")
 
 type Cmd =
   | { id: number; op: "list" }
@@ -50,6 +52,7 @@ type Cmd =
       stopBits?: number
       parity?: "none" | "even" | "odd" | "mark" | "space"
       flowControl?: boolean
+      encoding?: "utf8" | "latin1" | "binary"
     }
   | { id: number; op: "write"; handle: number; data: string }
   | { id: number; op: "close"; handle: number }
@@ -58,6 +61,7 @@ type Cmd =
 type SerialPortInst = InstanceType<typeof sp.SerialPort>
 
 const ports = new Map<number, SerialPortInst>()
+const decoders = new Map<number, InstanceType<typeof StringDecoder>>()
 let nextHandle = 1
 
 function send(payload: unknown) {
@@ -95,10 +99,19 @@ async function handle(cmd: Cmd) {
           autoOpen: false,
         })
         const handleId = nextHandle++
+        // STREAMING decode (was buf.toString('utf-8') per chunk — the cause of
+        // the "◆◆ mid-word" corruption when a multibyte char straddled a chunk
+        // boundary or a stray high byte appeared). latin1/binary = lossless 1:1.
+        const decoder = new StringDecoder(cmd.encoding === "latin1" || cmd.encoding === "binary" ? "latin1" : "utf8")
+        decoders.set(handleId, decoder)
         port.on("data", (buf: Buffer) => {
-          send({ event: "data", handle: handleId, data: buf.toString("utf-8") })
+          const text = decoder.write(buf)
+          if (text) send({ event: "data", handle: handleId, data: text })
         })
         port.on("close", () => {
+          const tail = decoders.get(handleId)?.end()
+          if (tail) send({ event: "data", handle: handleId, data: tail })
+          decoders.delete(handleId)
           ports.delete(handleId)
           send({ event: "close", handle: handleId, exitCode: 0 })
         })

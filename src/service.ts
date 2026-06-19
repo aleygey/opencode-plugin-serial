@@ -23,7 +23,7 @@
 
 import { EventEmitter } from "node:events"
 import { randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, createWriteStream, type WriteStream } from "node:fs"
 import os from "node:os"
 import nodePath from "node:path"
 import { z } from "zod"
@@ -31,7 +31,7 @@ import * as driver from "#serial-driver"
 import { SerialID } from "./schema"
 import * as Devices from "./devices"
 import { LockManager } from "./locks"
-import { reduceLines as reduceLinesImpl, type ReduceOptions as ReduceOptionsImpl } from "./reduce"
+import { reduceLines as reduceLinesImpl, type ReduceOptions as ReduceOptionsImpl, stripAnsi } from "./reduce"
 
 export namespace Serial {
   const BUFFER_LIMIT = 1024 * 1024 * 2
@@ -45,10 +45,12 @@ export namespace Serial {
   // logger, not stdout. Swap for console.* when debugging.
   const log = { info: (..._args: unknown[]) => {} }
 
-  // ── Configuration (base dir for device map + lock files) ──────────────────
+  // ── Configuration (base dir for device map + lock files + session logs) ───
   let locks: LockManager | undefined
+  let baseDirPath: string | undefined
 
   export function configure(opts: { base: string }) {
+    baseDirPath = opts.base
     locks = new LockManager(opts.base)
     Devices.load(opts.base)
   }
@@ -162,8 +164,10 @@ export namespace Serial {
     scanCursor: number
     deviceKey?: string
     eol?: string
+    encoding?: "utf8" | "latin1" | "binary"
     owner?: string
     leaseTimer?: ReturnType<typeof setInterval>
+    logStream?: WriteStream
   }
 
   // WebSocket control frame: 0x00 + UTF-8 JSON.
@@ -209,6 +213,11 @@ export namespace Serial {
     // Override the line terminator for this session ("cr"|"lf"|"crlf"|raw).
     // Defaults to the matched device's devices.json `eol`, else passthrough.
     eol: z.string().optional(),
+    // Inbound decoding override ("utf8" | "latin1" | "binary"); default from the
+    // device map, else "utf8". Use latin1/binary for non-UTF-8 / binary consoles.
+    encoding: z.enum(["utf8", "latin1", "binary"]).optional(),
+    // Tee raw output to <base>/logs/; default from the device map, else off.
+    log: z.boolean().optional(),
   })
 
   export type CreateInput = z.infer<typeof CreateInput>
@@ -248,6 +257,9 @@ export namespace Serial {
     tailBytes?: number
     sinceCursor?: number
     maxBytes?: number
+    /** Keep ANSI/control bytes in the returned text. Default false → stripped
+     *  for the agent (the raw bytes always stay in the ring buffer + WS). */
+    raw?: boolean
   }
 
   export type SnapshotResult = {
@@ -302,6 +314,12 @@ export namespace Serial {
   function teardown(session: Active) {
     if (session.leaseTimer) clearInterval(session.leaseTimer)
     if (locks && session.deviceKey && session.owner) locks.release(session.deviceKey, session.owner)
+    if (session.logStream) {
+      try {
+        session.logStream.end()
+      } catch {}
+      session.logStream = undefined
+    }
     for (const t of session.triggers.values()) {
       if (t.every) clearInterval(t.every.timer)
     }
@@ -395,9 +413,9 @@ export namespace Serial {
           w.resolve({
             matched: true,
             cursor: totalEnd,
-            match: match[0],
-            before: beforeLines.slice(-(w.contextLines + 1)).join("\n"),
-            after: afterLines.slice(0, w.contextLines + 1).join("\n"),
+            match: stripAnsi(match[0]),
+            before: stripAnsi(beforeLines.slice(-(w.contextLines + 1)).join("\n")),
+            after: stripAnsi(afterLines.slice(0, w.contextLines + 1).join("\n")),
           })
         } catch {}
       }
@@ -436,6 +454,22 @@ export namespace Serial {
     }, 20_000)
   }
 
+  // MobaXterm-style session logging: tee raw output to <base>/logs/. Idempotent
+  // so it can be turned on from the fresh-open OR the reuse path (e.g. an
+  // autoOpen'd session a later create asks to log). For latin1/binary sessions
+  // the onData tee reconstructs the original bytes so the file is byte-exact.
+  function openSessionLog(session: Active) {
+    if (session.logStream || !baseDirPath) return
+    try {
+      const dir = nodePath.join(baseDirPath, "logs")
+      mkdirSync(dir, { recursive: true })
+      const safe = session.info.path.replace(/[^A-Za-z0-9._-]+/g, "_") || "session"
+      session.logStream = createWriteStream(nodePath.join(dir, `${safe}-${session.info.id}.log`), { flags: "a" })
+    } catch {
+      // logging is best-effort; never block the session
+    }
+  }
+
   export async function create(
     input: CreateInput,
     ctx?: { owner?: string; takeover?: boolean },
@@ -444,6 +478,8 @@ export namespace Serial {
     const portInfo = await portForPath(input.path)
     const deviceKey = portInfo ? Devices.deviceKey(portInfo) : `path:${input.path}`
     const matchedDev = portInfo ? Devices.match(portInfo) : undefined
+    const encoding = input.encoding ?? matchedDev?.encoding
+    const logEnabled = input.log ?? matchedDev?.log ?? false
 
     // Device lease: one writer per physical prototype. Acquire BEFORE reuse so
     // a second agent can't latch onto a shared session it isn't allowed to drive.
@@ -470,6 +506,9 @@ export namespace Serial {
         // the heartbeat (an autoOpen'd / owner-less session had none), and
         // surface the new driver to monitors. deviceKey first so renew has it.
         existing.deviceKey = deviceKey
+        // encoding/eol are fixed at first open (can't change a live port); only
+        // logging can be turned on later for an already-open session.
+        if (logEnabled) openSessionLog(existing)
         if (owner) {
           existing.owner = owner
           existing.info.owner = owner
@@ -487,11 +526,14 @@ export namespace Serial {
       stopBits: input.stopBits,
       parity: input.parity,
       flowControl: input.flowControl,
+      encoding,
     })
 
     const defaultTitle = matchedDev
       ? `${matchedDev.name}${matchedDev.model ? ` (${matchedDev.model})` : ""}`
-      : `Serial ${id.slice(-4)}`
+      : /^telnet:\/\//i.test(input.path)
+        ? input.path.replace(/^telnet:\/\//i, "")
+        : `Serial ${id.slice(-4)}`
 
     // Per-device line terminator: explicit create override wins, else the
     // device map's eol, else undefined (passthrough). Applies to BOTH agent
@@ -522,14 +564,27 @@ export namespace Serial {
       scanCursor: 0,
       deviceKey,
       eol,
+      encoding,
       owner,
     }
     sessions.set(id, session)
 
     if (locks && owner) startLeaseTimer(session)
 
+    if (logEnabled) openSessionLog(session)
+
     port.onData((chunk) => {
       session.cursor += chunk.length
+
+      if (session.logStream) {
+        try {
+          session.logStream.write(
+            session.encoding === "latin1" || session.encoding === "binary" ? Buffer.from(chunk, "latin1") : chunk,
+          )
+        } catch {
+          // log write failed (disk full etc.) — never affect the live session
+        }
+      }
 
       for (const [key, ws] of session.subscribers.entries()) {
         if (ws.readyState !== 1) {
@@ -943,6 +998,12 @@ export namespace Serial {
       fromCursor = totalEnd - data.length
     }
 
+    // Strip ANSI/control bytes for the agent (display-only; the ring buffer and
+    // the WebSocket replay keep the escapes so the monitor renders color). The
+    // cursors above are decoded-string code-unit positions and stay correct —
+    // stripping only shortens this returned copy.
+    if (!options?.raw) data = stripAnsi(data)
+
     return { data, cursor: totalEnd, bufferCursor: totalStart, fromCursor, dropped }
   }
 
@@ -1025,9 +1086,12 @@ export namespace Serial {
     let sm: RegExpExecArray | null
     let stop = false
     const scanLine = (line: string, startOff: number): boolean => {
+      // Match + return ANSI-stripped lines so a colored "error" still matches
+      // and the agent gets clean text. Cursor stays the RAW byte offset.
+      const clean = stripAnsi(line)
       re.lastIndex = 0
-      if (re.test(line)) {
-        matches.push({ line, cursor: fromCursor + startOff })
+      if (re.test(clean)) {
+        matches.push({ line: clean, cursor: fromCursor + startOff })
         if (matches.length >= maxMatches) return true
       }
       return false
@@ -1077,9 +1141,9 @@ export namespace Serial {
       return {
         matched: true,
         cursor: session.cursor,
-        match: existingMatch[0],
-        before: splitLines(beforeText).slice(-(contextLines + 1)).join("\n"),
-        after: splitLines(afterText).slice(0, contextLines + 1).join("\n"),
+        match: stripAnsi(existingMatch[0]),
+        before: stripAnsi(splitLines(beforeText).slice(-(contextLines + 1)).join("\n")),
+        after: stripAnsi(splitLines(afterText).slice(0, contextLines + 1).join("\n")),
       }
     }
 

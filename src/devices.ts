@@ -55,6 +55,11 @@ export type Device = {
    *  match.path, e.g. "COM3" or "telnet://host:port"). Lets /serial show the
    *  session without waiting for the agent to serial_create. Default false. */
   autoOpen?: boolean
+  /** Inbound decoding: "utf8" (default, streaming) | "latin1" | "binary"
+   *  (1:1 byte passthrough, never corrupts non-UTF-8 / binary output). */
+  encoding?: "utf8" | "latin1" | "binary"
+  /** Tee this session's raw output to <base>/logs/<path>-<id>.log. Default false. */
+  log?: boolean
   notes?: string
 }
 

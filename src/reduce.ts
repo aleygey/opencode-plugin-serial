@@ -15,6 +15,23 @@
  * capped at maxPeriod. Worst case O(N * maxPeriod). Deterministic.
  */
 
+// Strip ANSI/VT escape sequences and stray control bytes so the AGENT sees
+// clean text (escape codes break its regex matchers and waste tokens). The raw
+// bytes stay in the ring buffer + WebSocket so the MONITOR can still render
+// color. Keeps \t \n \r. Used by the agent-facing snapshot/grep/digest/wait
+// paths in service.ts; NOT applied to the live trigger window.
+// eslint-disable-next-line no-control-regex
+const ANSI_CSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+// eslint-disable-next-line no-control-regex
+const ANSI_OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g
+// eslint-disable-next-line no-control-regex
+const ANSI_OTHER = /\x1b[@-Z\\-_]/g
+// eslint-disable-next-line no-control-regex
+const CTRL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
+export function stripAnsi(s: string): string {
+  return s.replace(ANSI_CSI, "").replace(ANSI_OSC, "").replace(ANSI_OTHER, "").replace(CTRL, "")
+}
+
 export type ReduceOptions = {
   /** Fold consecutive identical (or same-shape) lines: A A A -> "A   (x3)". */
   dedup?: boolean

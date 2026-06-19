@@ -1,4 +1,5 @@
 import type { SerialPort, PortInfo, SerialOpts } from "./driver"
+import { isTelnetPath, open as openTelnet } from "./telnet"
 import * as path from "path"
 import * as fs from "fs"
 
@@ -276,6 +277,9 @@ export async function listPorts(): Promise<PortInfo[]> {
 }
 
 export function open(devPath: string, opts: SerialOpts): SerialPort {
+  // telnet:// is a TCP socket — net.Socket works natively under Bun (no NAPI),
+  // so it bypasses the serialport node-sidecar helper entirely.
+  if (isTelnetPath(devPath)) return openTelnet(devPath, opts)
   // The public API is sync but our IPC is async. Resolve a handle id
   // lazily and queue any operations that arrive before it lands.
   const dataListeners = new Set<DataListener>()
@@ -297,6 +301,7 @@ export function open(devPath: string, opts: SerialOpts): SerialPort {
       stopBits: opts.stopBits ?? 1,
       parity: opts.parity ?? "none",
       flowControl: opts.flowControl ?? false,
+      encoding: opts.encoding ?? "utf8",
     })) as { handle: number }
     handleId = result.handle
     helper.unregisterHandle(-1)
