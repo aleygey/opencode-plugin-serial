@@ -2,10 +2,11 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "../vendor/tui"
 import { createSignal, createMemo, createEffect, onCleanup, For, Index, Show, batch } from "solid-js"
 import { useKeyboard, useTerminalDimensions, usePaste } from "@opentui/solid"
-import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs"
+import { readFileSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { parseLine, type Style } from "./ansi"
+import { stripAnsi } from "../reduce"
 
 /**
  * Serial monitor — TUI plugin (terminal view).
@@ -66,7 +67,29 @@ const DEFAULT_HIGHLIGHT: Array<{ re: RegExp; color: string }> = [
   { re: /\b(warn(ing)?)\b/i, color: "#fce94f" },
 ]
 
-type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string; eol?: string; rawHold?: boolean }
+type Session = { id: string; title: string; path: string; baudRate: number; status: string; owner?: string; eol?: string; rawHold?: boolean; logPath?: string }
+
+const LOG_VIEW_MAX = 16 * 1024 * 1024 // tail at most 16MB of the log file into the history view
+
+// Read the tail of a (possibly huge) log file without loading it all. Drops a
+// leading partial line when truncated. Returns the text + the full size.
+function tailFile(p: string, maxBytes: number): { text: string; bytes: number; truncated: boolean } {
+  const size = statSync(p).size
+  if (size <= maxBytes) return { text: readFileSync(p, "utf8"), bytes: size, truncated: false }
+  const fd = openSync(p, "r")
+  try {
+    const buf = Buffer.alloc(maxBytes)
+    // Slice to the bytes ACTUALLY read — if the file was rotated/truncated
+    // between stat and read, the Buffer's zero-fill would otherwise leak NULs.
+    const n = readSync(fd, buf, 0, maxBytes, Math.max(0, size - maxBytes))
+    let text = buf.toString("utf8", 0, n)
+    const nl = text.indexOf("\n")
+    if (nl >= 0) text = text.slice(nl + 1) // drop the leading partial line
+    return { text, bytes: size, truncated: true }
+  } finally {
+    closeSync(fd)
+  }
+}
 
 function readServerBase(): string | undefined {
   const env = process.env.OPENCODE_SERIAL_URL
@@ -514,6 +537,19 @@ function Sidebar(props: { api: TuiPluginApi }) {
 // ── Full-screen terminal monitor ─────────────────────────────────────────────
 type Line = { text: string; start: Style } // text = raw line (may contain ANSI), no trailing \n
 
+// Build a Line[] from a blob (file load), carrying SGR state across lines.
+// Caller passes \r-normalized text.
+function buildLines(text: string): Line[] {
+  const parts = text.split("\n")
+  const out: Line[] = []
+  let start: Style = {}
+  for (let i = 0; i < parts.length; i++) {
+    out.push({ text: parts[i]!, start })
+    start = parseLine(parts[i]!, start).end
+  }
+  return out
+}
+
 function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> }) {
   const dim = useTerminalDimensions()
   const theme = () => props.api.theme.current
@@ -562,6 +598,12 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
   // following = pinned to newest (auto-scroll on new data).
   const [anchorBottom, setAnchorBottom] = createSignal(0)
   const [following, setFollowing] = createSignal(true)
+  // Full-history LOG VIEW: when set, the viewport/scroll/find act on the
+  // session's log FILE (everything since session start, beyond the RAM ring)
+  // instead of the live buffer; live `lines` keep accumulating behind it.
+  const [logView, setLogView] = createSignal<Line[] | undefined>(undefined)
+  const [logMeta, setLogMeta] = createSignal<{ bytes: number; truncated: boolean } | undefined>(undefined)
+  const activeLines = (): Line[] => logView() ?? lines
 
   let ws: WebSocket | undefined
   let connectedTo: string | undefined
@@ -586,13 +628,17 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       dropped = lines.length - MAX_LINES
       lines = lines.slice(dropped)
     }
-    if (following()) setAnchorBottom(lines.length - 1)
-    else if (dropped) setAnchorBottom((a) => Math.max(0, a - dropped))
-    // Find matches hold ABSOLUTE line indices — rebuild them against the
-    // trimmed buffer so gutter markers + n/prev jumps stay correct.
-    if (dropped) {
-      const f = find()
-      if (f && f.query) setFind(runFind(f.query))
+    // While the log-file view is up, its anchor/find are independent of the
+    // live buffer — don't let live appends move the scroll or rebuild matches.
+    if (!logView()) {
+      if (following()) setAnchorBottom(lines.length - 1)
+      else if (dropped) setAnchorBottom((a) => Math.max(0, a - dropped))
+      // Find matches hold ABSOLUTE line indices — rebuild them against the
+      // trimmed buffer so gutter markers + next/prev jumps stay correct.
+      if (dropped) {
+        const f = find()
+        if (f && f.query) setFind(runFind(f.query))
+      }
     }
   }
 
@@ -644,6 +690,12 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     }
     lines = [{ text: "", start: {} }]
     pending = ""
+    // Reset live buffer + tear down any log-file view atomically, so switching
+    // session can't leave the old session's log on screen (don't rely on the
+    // separate session-switch effect's ordering).
+    setLogView(undefined)
+    setLogMeta(undefined)
+    setFind(undefined)
     setFollowing(true)
     setAnchorBottom(0)
     setVersion((v) => v + 1)
@@ -674,30 +726,40 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     void setRawHold(false, rawHeldSid)
   })
 
-  // ── Scroll ─────────────────────────────────────────────────────────────────
+  // ── Scroll (acts on the ACTIVE buffer — live or the log-file view) ──────────
   const scrollBy = (deltaLines: number) => {
-    const n = lines.length
+    const n = activeLines().length
     const a = Math.max(0, Math.min(n - 1, anchorBottom() + deltaLines))
     batch(() => {
       setAnchorBottom(a)
-      setFollowing(a >= n - 1)
+      setFollowing(!logView() && a >= n - 1) // following only meaningful for the live buffer
     })
   }
   const scrollToTop = () =>
     batch(() => {
-      const a = Math.min(lines.length - 1, viewportH() - 1)
+      const n = activeLines().length
+      const a = Math.min(n - 1, viewportH() - 1)
       setAnchorBottom(a)
-      setFollowing(a >= lines.length - 1) // a short buffer that fits → stay following
+      setFollowing(!logView() && a >= n - 1)
     })
-  const scrollToBottom = () => batch(() => (setAnchorBottom(lines.length - 1), setFollowing(true)))
+  const scrollToBottom = () => batch(() => (setAnchorBottom(activeLines().length - 1), setFollowing(!logView())))
 
-  // ── Find (forward incremental search over the line buffer) ──────────────────
+  // ── Find (incremental search over the ACTIVE buffer: live ring OR log file) ──
   const [find, setFind] = createSignal<{ query: string; matches: number[]; idx: number } | undefined>(undefined)
   const runFind = (query: string, preferFrom?: number): { query: string; matches: number[]; idx: number } => {
+    const buf = activeLines()
     const matches: number[] = []
     if (query) {
       const q = query.toLowerCase()
-      for (let i = 0; i < lines.length; i++) if (lines[i]!.text.toLowerCase().includes(q)) matches.push(i)
+      // Match against the VISIBLE (ANSI-stripped) text so the gutter marker,
+      // count, jump, and the substring highlight all agree (otherwise a query
+      // like "31m" would mark a colored line that shows no visible hit). Strip
+      // only when the line actually contains an escape (most don't).
+      for (let i = 0; i < buf.length; i++) {
+        const raw = buf[i]!.text
+        const hay = (raw.includes("\x1b") ? stripAnsi(raw) : raw).toLowerCase()
+        if (hay.includes(q)) matches.push(i)
+      }
     }
     // pick the match nearest-below the current view
     let idx = matches.length - 1
@@ -709,9 +771,38 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     if (st.idx < 0 || !st.matches.length) return
     const line = st.matches[st.idx]!
     batch(() => {
-      setAnchorBottom(Math.min(lines.length - 1, line + Math.floor(viewportH() / 2)))
+      setAnchorBottom(Math.min(activeLines().length - 1, line + Math.floor(viewportH() / 2)))
       setFollowing(false)
     })
+  }
+
+  // ── Full-history log-file view ──────────────────────────────────────────────
+  const enterLogView = () => {
+    const p = current()?.logPath
+    if (!p) {
+      warn("no log file for this device — set \"log\": true in devices.json for full history")
+      return
+    }
+    try {
+      const { text, bytes, truncated } = tailFile(p, LOG_VIEW_MAX)
+      const ll = buildLines(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"))
+      setFind(undefined)
+      setLogView(ll)
+      setLogMeta({ bytes, truncated })
+      batch(() => {
+        setFollowing(false)
+        setAnchorBottom(Math.min(ll.length - 1, viewportH() - 1)) // start at the TOP
+      })
+    } catch (e) {
+      if ((e as { code?: string })?.code === "ENOENT") warn("log file not created yet — no output logged so far")
+      else warn("log read failed: " + (e as Error).message)
+    }
+  }
+  const exitLogView = () => {
+    setFind(undefined)
+    setLogView(undefined)
+    setLogMeta(undefined)
+    scrollToBottom()
   }
   const findStep = (dir: 1 | -1) => {
     const st = find()
@@ -749,6 +840,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       warn("⚠ serial link not open — can't enter raw mode")
       return
     }
+    if (logView()) exitLogView() // raw is for live interaction, not history
     rawHeldSid = current()?.id
     setRaw(true)
     void setRawHold(true, rawHeldSid)
@@ -807,7 +899,9 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     draft = ""
     setComp(undefined)
     setSearch(undefined)
+    setFind(undefined)
     if (raw()) exitRaw()
+    if (logView()) exitLogView() // don't keep the old session's log file on screen
   })
 
   const wsOpen = () => !!ws && ws.readyState === 1
@@ -1055,7 +1149,9 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       return
     }
 
-    // escape — layered: completion → clear input → exit route.
+    // escape — LAYERED, one level per press (raw + find handled above):
+    // completion → clear input → exit log view → exit route. So Esc-to-exit-
+    // /serial stays the LAST stage and never collides with sub-modes.
     if (k.name === "escape") {
       consume()
       if (comp()) return cancelCompletion()
@@ -1064,6 +1160,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
         setHistIdx(undefined)
         return
       }
+      if (logView()) return exitLogView()
       props.api.route.navigate("home")
       return
     }
@@ -1086,6 +1183,15 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
       return
     }
 
+    // F5 toggles the full-history LOG-FILE view (everything since session start,
+    // beyond the 20k RAM ring). A function key avoids clashing with device
+    // commands that start with a letter and with VSCode's Ctrl-chords.
+    if (k.name === "f5") {
+      consume()
+      logView() ? exitLogView() : enterLogView()
+      return
+    }
+
     // ctrl+r → reverse-i-search (history).
     if (k.ctrl && k.name === "r") {
       consume()
@@ -1102,7 +1208,7 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     const hadComp = comp() !== undefined
     if (hadComp) setComp(undefined)
 
-    // "/" opens find over the scrollback (only when the input is empty).
+    // "/" opens find over the ACTIVE buffer (only when the input is empty).
     if (k.char === "/" && editor.text() === "") {
       consume()
       const st = runFind("")
@@ -1153,8 +1259,9 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     }
   })
 
-  // ── Render one scrollback line → spans (ANSI color + keyword highlight) ──────
-  const renderLineSpans = (line: Line, dev?: DeviceEx) => {
+  // ── Render one scrollback line → spans (ANSI color + keyword highlight +
+  //    exact find-substring highlight) ──────────────────────────────────────
+  const renderLineSpans = (line: Line, dev: DeviceEx | undefined, query: string) => {
     const { runs } = parseLine(line.text, line.start)
     const rules = highlightRules(dev)
     // line-level keyword color, applied only to runs the device left uncolored
@@ -1168,25 +1275,50 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
     }
     const t = theme()
     if (!runs.length) return [<span> </span>]
-    return runs.map((run) => {
+    const q = query.toLowerCase()
+    const hlFg = t.background ?? "#101010"
+    const hlBg = t.warning ?? "#fce94f"
+    const spans: any[] = []
+    for (const run of runs) {
+      const baseStyle: Record<string, any> = {}
       const fg = run.style.reverse ? run.style.bg ?? t.backgroundPanel : run.style.fg ?? kw
       const bg = run.style.reverse ? run.style.fg ?? t.text : run.style.bg
-      const style: Record<string, any> = {}
-      if (fg) style.fg = fg
-      if (bg) style.bg = bg
-      return <span style={style}>{run.text}</span>
-    })
+      if (fg) baseStyle.fg = fg
+      if (bg) baseStyle.bg = bg
+      if (!q) {
+        spans.push(<span style={baseStyle}>{run.text}</span>)
+        continue
+      }
+      // highlight exact (case-insensitive) query occurrences within this run
+      const lower = run.text.toLowerCase()
+      let pos = 0
+      let hit = lower.indexOf(q, pos)
+      if (hit < 0) {
+        spans.push(<span style={baseStyle}>{run.text}</span>)
+        continue
+      }
+      while (hit >= 0) {
+        if (hit > pos) spans.push(<span style={baseStyle}>{run.text.slice(pos, hit)}</span>)
+        spans.push(<span style={{ fg: hlFg, bg: hlBg }}>{run.text.slice(hit, hit + q.length)}</span>)
+        pos = hit + q.length
+        hit = lower.indexOf(q, pos)
+      }
+      if (pos < run.text.length) spans.push(<span style={baseStyle}>{run.text.slice(pos)}</span>)
+    }
+    return spans
   }
 
   const visible = () => {
-    void version() // re-render trigger
-    const n = lines.length
+    void version() // re-render trigger (live appends bump version)
+    const buf = activeLines()
+    const n = buf.length
     const end = Math.min(n, anchorBottom() + 1)
     const start = Math.max(0, end - viewportH())
     const dev = deviceForPath(current()?.path)
     const set = matchSet()
+    const q = find()?.query ?? ""
     const out: Array<{ spans: any; match: boolean }> = []
-    for (let i = start; i < end; i++) out.push({ spans: renderLineSpans(lines[i]!, dev), match: set.has(i) })
+    for (let i = start; i < end; i++) out.push({ spans: renderLineSpans(buf[i]!, dev, q), match: set.has(i) })
     return out
   }
 
@@ -1215,17 +1347,36 @@ function Monitor(props: { api: TuiPluginApi; params?: Record<string, unknown> })
           <Show when={!raw() && current()?.owner}>
             <span style={{ fg: theme().warning ?? theme().textMuted }}> · driver: agent {(current()?.owner ?? "").slice(0, 12)}</span>
           </Show>
-          <Show when={!following()}>
+          <Show when={logView()}>
+            <span style={{ fg: theme().success }}>
+              {" "}· LOG {Math.round((logMeta()?.bytes ?? 0) / 1024)}KB{logMeta()?.truncated ? " (tail)" : ""} · F5/esc live
+            </span>
+          </Show>
+          <Show when={!logView() && !following()}>
             <span style={{ fg: theme().textMuted }}> · scrolled (End↓)</span>
           </Show>
         </text>
-        <text fg={theme().textMuted}>PgUp/Dn scroll · / find · F4 raw · ↑↓ hist · ^R · [ ]/F3 switch · esc</text>
+        <text fg={theme().textMuted}>PgUp/Dn/wheel scroll · / find · F5 full-log · F4 raw · ↑↓ hist · [ ]/F3 switch · esc</text>
       </box>
       <Show
         when={sessions().length > 0}
         fallback={<text fg={theme().textMuted}>No active serial sessions. Ask the agent to open one with serial_create.</text>}
       >
-        <box border borderColor={raw() ? theme().error ?? theme().border : theme().border} flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1}>
+        <box
+          border
+          borderColor={raw() ? theme().error ?? theme().border : logView() ? theme().success : theme().border}
+          flexDirection="column"
+          flexGrow={1}
+          paddingLeft={1}
+          paddingRight={1}
+          onMouseScroll={(e: any) => {
+            const dir = e?.scroll?.direction
+            if (dir !== "up" && dir !== "down") return
+            const step = Math.max(1, Math.round((e?.scroll?.delta ?? 1) * 3)) // ~opencode scroll feel
+            scrollBy(dir === "up" ? -step : step)
+            e?.stopPropagation?.()
+          }}
+        >
           {/* Only the visible window is rendered. <Index> keys by POSITION (a
               fixed-height viewport) and passes each row as a signal, so a flush
               patches changed cells instead of remounting every row. */}

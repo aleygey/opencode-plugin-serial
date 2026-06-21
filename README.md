@@ -77,8 +77,9 @@ writes any text frame to the port verbatim).
 | `↑` / `↓` | history (per-device, persisted, **shared with the agent** — `↑` recalls commands the agent ran too) |
 | `Ctrl+R` | reverse-i-search through history (bash-style) |
 | `Ctrl+C` / `Ctrl+G` | send `0x03` — interrupt the program on the DEVICE |
-| `PageUp` / `PageDown` | scroll the scrollback (20k lines); `Home`/`End` (input empty) = top / bottom-follow |
-| `/` (input empty) | incremental **find** over the scrollback; `↓`/`↑` next/prev match; `Esc` closes |
+| `PageUp` / `PageDown` / mouse wheel | scroll the scrollback (20k lines); `Home`/`End` (input empty) = top / bottom-follow |
+| `F5` | toggle **full-history log view** — read the whole session log FILE (beyond the 20k RAM ring); scroll/find work over it; `Esc`/`F5` back to live |
+| `/` (input empty) | incremental **find** over the active buffer (live OR log file); `↓`/`↑` next/prev match (exact substring highlighted); `Esc` closes |
 | `F4` | toggle **RAW** passthrough (device-native completion/line-editing); `Esc` exits raw |
 | `Esc` | LAYERED, one level per press: raw → find → reverse-i-search → completion → clear input → exit view |
 | `[` `]` (input empty) / `F3` | switch session |
@@ -102,6 +103,17 @@ The view renders only the visible rows (cheap at any depth) with **device ANSI
 color** (16/256/truecolor) and **local keyword highlight** (error→red, warn→
 yellow by default; add rules per device via `devices.json` `highlight`). Scroll
 back through ~20k lines; new output auto-follows only while pinned to the bottom.
+
+### Full-history log view (v0.7.0) — F5
+
+The 20k-line scrollback above lives in RAM (the WebSocket replays the server's
+2MB ring). For the **complete session history**, press `F5`: the monitor reads
+the session's log FILE directly (`Info.logPath`, tail of up to 16MB) and you can
+scroll + `/`-search **everything since the session started**. `Esc`/`F5` returns
+to the live view. Mouse wheel scrolls; `/` highlights the exact matched
+substring. **Needs `"log": true` on the device** (that's what writes the file) —
+otherwise F5 says so. The log file is also the place to copy text out of (the TUI
+has no select-copy).
 
 **Completion never queries the device.** The serial line is a single shared
 channel that the agent pattern-matches (`serial_collect` / `serial_wait`) — a

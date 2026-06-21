@@ -202,6 +202,9 @@ export namespace Serial {
       // A human holds the monitor in RAW mode (driving the device directly) →
       // agent writes are paused. Surfaced for the driver badge.
       rawHold: z.boolean().optional(),
+      // Absolute path of the session's log file (when log:true). The monitor
+      // reads it directly for full-history scrollback + log-file search.
+      logPath: z.string().optional(),
     })
     .meta({ ref: "Serial" })
 
@@ -473,7 +476,13 @@ export namespace Serial {
       const dir = nodePath.join(baseDirPath, "logs")
       mkdirSync(dir, { recursive: true })
       const safe = session.info.path.replace(/[^A-Za-z0-9._-]+/g, "_") || "session"
-      session.logStream = createWriteStream(nodePath.join(dir, `${safe}-${session.info.id}.log`), { flags: "a" })
+      const file = nodePath.resolve(nodePath.join(dir, `${safe}-${session.info.id}.log`))
+      session.logStream = createWriteStream(file, { flags: "a" })
+      // Surface the ABSOLUTE path so the monitor can read it for full-history
+      // scrollback. No emit needed — the monitor polls /serial (the list carries
+      // logPath) within ~1.5s; on the fresh-open path serial.created already
+      // carries it. Emitting here would fire serial.updated before created.
+      session.info.logPath = file
     } catch {
       // logging is best-effort; never block the session
     }
